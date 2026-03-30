@@ -2,7 +2,7 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
-from aiogram.enums import ParseMode, ChatAction
+from aiogram.enums import ChatAction
 
 from config import (
     MANAGER_TOKEN,
@@ -24,9 +24,19 @@ dp = Dispatcher()
 _bot_ids: set[int] = set()
 
 
-async def _typing(bot: Bot, chat_id: int, duration: float = 2.0) -> None:
-    await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    await asyncio.sleep(duration)
+async def _typing_while(bot: Bot, chat_id: int, coro):
+    """Непрерывно показывает 'печатает' пока выполняется coro."""
+    async def keep_typing():
+        while True:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            await asyncio.sleep(4)
+
+    typing_task = asyncio.create_task(keep_typing())
+    try:
+        result = await coro
+    finally:
+        typing_task.cancel()
+    return result
 
 
 async def run_pipeline(task: str) -> None:
@@ -36,9 +46,8 @@ async def run_pipeline(task: str) -> None:
     await manager_bot.send_message(chat_id, "📋 Принял задачу! Передаю исследователю...")
 
     # Шаг 2: исследователь работает
-    await _typing(researcher_bot, chat_id)
     try:
-        research = await ask_researcher(task)
+        research = await _typing_while(researcher_bot, chat_id, ask_researcher(task))
     except Exception as exc:
         logger.error("Researcher API error: %s", exc)
         await manager_bot.send_message(chat_id, f"❌ Ошибка на этапе исследования: {exc}")
@@ -46,9 +55,8 @@ async def run_pipeline(task: str) -> None:
     await researcher_bot.send_message(chat_id, research)
 
     # Шаг 3: аналитик работает
-    await _typing(analyst_bot, chat_id)
     try:
-        analysis = await ask_analyst(research)
+        analysis = await _typing_while(analyst_bot, chat_id, ask_analyst(research))
     except Exception as exc:
         logger.error("Analyst API error: %s", exc)
         await manager_bot.send_message(chat_id, f"❌ Ошибка на этапе анализа: {exc}")
@@ -56,9 +64,8 @@ async def run_pipeline(task: str) -> None:
     await analyst_bot.send_message(chat_id, analysis)
 
     # Шаг 4: менеджер формирует финальный итог
-    await _typing(manager_bot, chat_id)
     try:
-        summary = await ask_manager(analysis)
+        summary = await _typing_while(manager_bot, chat_id, ask_manager(analysis))
     except Exception as exc:
         logger.error("Manager API error: %s", exc)
         await manager_bot.send_message(chat_id, f"❌ Ошибка на этапе подведения итогов: {exc}")
