@@ -119,6 +119,9 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
             if "web_search" in capabilities:
                 web_results = await web_search.search_web(task)
 
+            # Сохраняем пользовательский запрос как входящий контекст агента
+            await database.save_agent_message(task_id, slug, "user", task_for_agent)
+
             # Выполняем агента с индикатором печати
             try:
                 result = await typing_while(
@@ -206,6 +209,9 @@ async def handle_direct_mention(slug: str, message: Message) -> None:
     db_agent = await database.get_agent_by_slug(slug)
     task = message.text or message.caption or "Что сделать?"
 
+    # Сохраняем пользовательское сообщение в контекст агента
+    await database.save_agent_message(0, slug, "user", task)
+
     try:
         result = await typing_while(
             agent_bot,
@@ -225,6 +231,8 @@ async def handle_direct_mention(slug: str, message: Message) -> None:
             )
         except Exception:
             await agent_bot.send_message(config.GROUP_CHAT_ID, f"{emoji} {result}")
+        # Сохраняем ответ агента в контекст
+        await database.save_agent_message(0, slug, "assistant", result)
     except Exception as exc:
         logger.error("Direct mention error for agent '%s': %s", slug, exc)
         manager_bot = dynamic_loader.get_bot("manager")
@@ -258,13 +266,20 @@ async def on_message(message: Message) -> None:
     if message.text and message.text.startswith("/"):
         return
 
-    # Определяем какому боту пришло сообщение
-    bot_id = message.bot.id if message.bot else 0
-    receiving_slug = dynamic_loader.get_slug_by_bot_id(bot_id)
+    # Проверяем, упомянут ли какой-то не-менеджер бот через @username
+    mentioned_slug = None
+    if message.text or message.caption:
+        text_to_check = (message.text or message.caption or "").lower()
+        for slug in dynamic_loader.get_all_bots():
+            if slug == "manager":
+                continue
+            username = dynamic_loader.get_username(slug)
+            if username and f"@{username.lower()}" in text_to_check:
+                mentioned_slug = slug
+                break
 
-    # Если сообщение пришло не менеджеру — прямое обращение к агенту
-    if receiving_slug and receiving_slug != "manager":
-        asyncio.create_task(handle_direct_mention(receiving_slug, message))
+    if mentioned_slug:
+        asyncio.create_task(handle_direct_mention(mentioned_slug, message))
         return
 
     manager_bot = dynamic_loader.get_bot("manager")

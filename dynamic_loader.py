@@ -7,8 +7,9 @@ from aiogram import Bot, Dispatcher
 logger = logging.getLogger(__name__)
 
 # Состояние модуля
-_active_bots: Dict[str, Bot] = {}       # slug → Bot
-_bot_user_ids: Dict[str, int] = {}      # slug → telegram user id
+_active_bots: Dict[str, Bot] = {}           # slug → Bot
+_bot_user_ids: Dict[str, int] = {}          # slug → telegram user id
+_bot_usernames: Dict[str, str] = {}         # slug → @username (без @)
 _polling_tasks: Dict[str, asyncio.Task] = {}
 _dp: Optional[Dispatcher] = None
 
@@ -37,6 +38,11 @@ def get_slug_by_bot_id(bot_id: int) -> Optional[str]:
     return None
 
 
+def get_username(slug: str) -> Optional[str]:
+    """Возвращает username бота (без @) по slug."""
+    return _bot_usernames.get(slug)
+
+
 def get_all_bot_ids() -> Set[int]:
     """Возвращает множество всех кешированных Telegram user ID ботов."""
     return set(_bot_user_ids.values())
@@ -50,9 +56,10 @@ async def add_bot(slug: str, token: str, start_polling: bool = True) -> Bot:
     bot = Bot(token=token)
     _active_bots[slug] = bot
 
-    # Получаем информацию о боте и кешируем его user id
+    # Получаем информацию о боте и кешируем его user id и username
     me = await bot.get_me()
     _bot_user_ids[slug] = me.id
+    _bot_usernames[slug] = me.username or ""
     logger.info("Bot loaded: @%s (%s)", me.username, slug)
 
     # Запускаем кастомный polling если нужно
@@ -84,6 +91,7 @@ async def remove_bot(slug: str) -> None:
 
     # Удаляем из кеша user ids
     _bot_user_ids.pop(slug, None)
+    _bot_usernames.pop(slug, None)
     logger.info("Bot removed: %s", slug)
 
 
@@ -100,10 +108,14 @@ async def _run_polling(bot: Bot, slug: str) -> None:
             updates = await bot.get_updates(
                 offset=offset,
                 timeout=30,
-                allowed_updates=["message", "callback_query"],
+                # Не-менеджеры получают только текстовые сообщения и фото
+                allowed_updates=["message"],
             )
             for update in updates:
                 offset = update.update_id + 1
+                # Пропускаем голосовые — их обрабатывает только менеджер
+                if update.message and update.message.voice:
+                    continue
                 asyncio.create_task(_dp.feed_update(bot, update))
 
         except asyncio.CancelledError:
