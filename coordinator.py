@@ -1,96 +1,316 @@
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
-from aiogram.enums import ChatAction
 
-from config import (
-    MANAGER_TOKEN,
-    RESEARCHER_TOKEN,
-    ANALYST_TOKEN,
-    GROUP_CHAT_ID,
-)
-from agents import ask_researcher, ask_analyst, ask_manager
+from aiogram import Dispatcher, F
+from aiogram.types import Message
+
+import config
+import database
+import dynamic_loader
+import agents as agents_module
+import media
+import web_search
+from utils import typing_while
 
 logger = logging.getLogger(__name__)
 
-manager_bot = Bot(token=MANAGER_TOKEN, default=None)
-researcher_bot = Bot(token=RESEARCHER_TOKEN, default=None)
-analyst_bot = Bot(token=ANALYST_TOKEN, default=None)
-
-dp = Dispatcher()
-
-# IDs ботов — заполняются при старте, чтобы фильтровать их собственные сообщения
-_bot_ids: set[int] = set()
+# Эмодзи для агентов по slug
+AGENT_EMOJI = {
+    "researcher": "🔍",
+    "analyst": "📊",
+    "manager": "📋",
+}
 
 
-async def _typing_while(bot: Bot, chat_id: int, coro):
-    """Непрерывно показывает 'печатает' пока выполняется coro."""
-    async def keep_typing():
-        while True:
-            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            await asyncio.sleep(4)
+def setup(dp: Dispatcher) -> None:
+    """Регистрирует основной обработчик сообщений."""
+    dp.message.register(on_message, F.chat.id == config.GROUP_CHAT_ID)
 
-    typing_task = asyncio.create_task(keep_typing())
+
+async def run_pipeline(message: Message, task: str, image_b64: str = None) -> None:
+    """
+    Основной pipeline обработки задачи:
+    маршрутизация → выполнение агентами → финальный брифинг.
+    """
+    user_id = message.from_user.id
+    manager_bot = dynamic_loader.get_bot("manager")
+    chat_id = config.GROUP_CHAT_ID
+
+    if not manager_bot:
+        logger.error("Manager bot not found")
+        return
+
+    # Создаём задачу в БД
+    task_id = await database.create_task(user_id, task)
+
     try:
-        result = await coro
-    finally:
-        typing_task.cancel()
-    return result
+        # Получаем историю задач для контекста
+        history = await database.get_recent_tasks(user_id, 5)
+        if history:
+            history_lines = []
+            for t in history:
+                preview = t["task_text"][:60] + ("..." if len(t["task_text"]) > 60 else "")
+                history_lines.append(f"- [{t['status']}] {preview}")
+            history_text = "\n".join(history_lines)
+        else:
+            history_text = "История пуста."
 
+        # Получаем список активных агентов
+        active_agents = await database.get_all_active_agents()
+        if active_agents:
+            agents_description = "\n".join(
+                f"- {a['name']} (slug: {a['slug']}): {a.get('description', '')}"
+                for a in active_agents
+                if a["slug"] != "manager"
+            )
+        else:
+            agents_description = "Нет доступных агентов."
 
-async def run_pipeline(task: str) -> None:
-    chat_id = GROUP_CHAT_ID
+        # Маршрутизируем задачу
+        route_result = await agents_module.route_task(task, agents_description, history_text)
+        route = route_result.get("route", "chain")
+        agent_slugs = route_result.get("agents", ["researcher", "analyst"])
 
-    # Шаг 1: менеджер принимает задачу
-    await manager_bot.send_message(chat_id, "📋 Принял задачу! Передаю исследователю...")
+        logger.info("Task #%d routed: %s → %s", task_id, route, agent_slugs)
 
-    # Шаг 2: исследователь работает
-    try:
-        research = await _typing_while(researcher_bot, chat_id, ask_researcher(task))
+        # Обрабатываем маршрут
+        if route == "direct":
+            answer = route_result.get("answer", "")
+            if answer:
+                await manager_bot.send_message(chat_id, answer, parse_mode="HTML")
+                await database.save_agent_message(task_id, "manager", "assistant", answer)
+            await database.update_task_status(task_id, "done")
+            return
+
+        if route == "suggest_agent":
+            suggestion = route_result.get("description", "")
+            text = (
+                f"💡 Для этой задачи нужен новый агент!\n\n"
+                f"<i>{suggestion}</i>\n\n"
+                f"Используй /addagent чтобы создать его."
+            )
+            await manager_bot.send_message(chat_id, text, parse_mode="HTML")
+            await database.update_task_status(task_id, "done")
+            return
+
+        # route == "chain" или "single"
+        # Сообщаем о начале обработки
+        first_slug = agent_slugs[0] if agent_slugs else "агенту"
+        first_agent_data = await database.get_agent_by_slug(first_slug)
+        first_agent_name = first_agent_data["name"] if first_agent_data else first_slug
+        await manager_bot.send_message(
+            chat_id,
+            f"📋 Принял задачу! Передаю {first_agent_name}...",
+        )
+
+        task_for_agent = task
+
+        for slug in agent_slugs:
+            agent_bot = dynamic_loader.get_bot(slug)
+            if not agent_bot:
+                logger.warning("Bot for agent '%s' not found, skipping", slug)
+                continue
+
+            db_agent = await database.get_agent_by_slug(slug)
+
+            # Проверяем нужен ли веб-поиск
+            capabilities = db_agent.get("capabilities", "text") if db_agent else "text"
+            web_results = None
+            if "web_search" in capabilities:
+                web_results = await web_search.search_web(task)
+
+            # Выполняем агента с индикатором печати
+            try:
+                result = await typing_while(
+                    agent_bot,
+                    chat_id,
+                    agents_module.run_agent_by_slug(
+                        slug=slug,
+                        task=task_for_agent,
+                        db_agent=db_agent,
+                        image_b64=image_b64,
+                        web_results=web_results,
+                    ),
+                )
+            except Exception as exc:
+                logger.error("Agent '%s' error: %s", slug, exc)
+                await manager_bot.send_message(chat_id, f"❌ Ошибка агента {slug}: {exc}")
+                await database.update_task_status(task_id, "error")
+                return
+
+            # Сохраняем результат в БД
+            await database.save_agent_message(task_id, slug, "assistant", result)
+
+            # Отправляем результат от имени бота агента
+            emoji = AGENT_EMOJI.get(slug, "🤖")
+            try:
+                await agent_bot.send_message(
+                    chat_id,
+                    f"{emoji} {result}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                # Если HTML не парсится — отправляем без форматирования
+                await agent_bot.send_message(chat_id, f"{emoji} {result}")
+
+            await asyncio.sleep(1.5)
+
+            # Результат текущего агента передаём следующему
+            task_for_agent = result
+
+        # Финальный брифинг менеджера (только для цепочки)
+        if route == "chain" and len(agent_slugs) > 1:
+            try:
+                summary = await typing_while(
+                    manager_bot,
+                    chat_id,
+                    agents_module.run_manager_final(task_for_agent),
+                )
+                await database.save_agent_message(task_id, "manager", "assistant", summary)
+                try:
+                    await manager_bot.send_message(
+                        chat_id,
+                        f"✅ Итоговый брифинг:\n\n{summary}",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    await manager_bot.send_message(
+                        chat_id,
+                        f"✅ Итоговый брифинг:\n\n{summary}",
+                    )
+            except Exception as exc:
+                logger.error("Manager final summary error: %s", exc)
+                await manager_bot.send_message(chat_id, f"❌ Ошибка финального брифинга: {exc}")
+
+        await database.update_task_status(task_id, "done")
+
     except Exception as exc:
-        logger.error("Researcher API error: %s", exc)
-        await manager_bot.send_message(chat_id, f"❌ Ошибка на этапе исследования: {exc}")
-        return
-    await researcher_bot.send_message(chat_id, research)
+        logger.error("Pipeline error for task #%d: %s", task_id, exc)
+        await database.update_task_status(task_id, "error")
+        try:
+            await manager_bot.send_message(chat_id, f"❌ Ошибка обработки задачи: {exc}")
+        except Exception:
+            pass
 
-    # Шаг 3: аналитик работает
+
+async def handle_direct_mention(slug: str, message: Message) -> None:
+    """
+    Обрабатывает прямое обращение к конкретному агенту.
+    Нет финального брифинга менеджера.
+    """
+    agent_bot = dynamic_loader.get_bot(slug)
+    if not agent_bot:
+        logger.warning("Direct mention: bot for '%s' not found", slug)
+        return
+
+    db_agent = await database.get_agent_by_slug(slug)
+    task = message.text or message.caption or "Что сделать?"
+
     try:
-        analysis = await _typing_while(analyst_bot, chat_id, ask_analyst(research))
+        result = await typing_while(
+            agent_bot,
+            config.GROUP_CHAT_ID,
+            agents_module.run_agent_by_slug(
+                slug=slug,
+                task=task,
+                db_agent=db_agent,
+            ),
+        )
+        emoji = AGENT_EMOJI.get(slug, "🤖")
+        try:
+            await agent_bot.send_message(
+                config.GROUP_CHAT_ID,
+                f"{emoji} {result}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            await agent_bot.send_message(config.GROUP_CHAT_ID, f"{emoji} {result}")
     except Exception as exc:
-        logger.error("Analyst API error: %s", exc)
-        await manager_bot.send_message(chat_id, f"❌ Ошибка на этапе анализа: {exc}")
-        return
-    await analyst_bot.send_message(chat_id, analysis)
-
-    # Шаг 4: менеджер формирует финальный итог
-    try:
-        summary = await _typing_while(manager_bot, chat_id, ask_manager(analysis))
-    except Exception as exc:
-        logger.error("Manager API error: %s", exc)
-        await manager_bot.send_message(chat_id, f"❌ Ошибка на этапе подведения итогов: {exc}")
-        return
-    await manager_bot.send_message(chat_id, f"✅ Итоговый брифинг:\n\n{summary}")
+        logger.error("Direct mention error for agent '%s': %s", slug, exc)
+        manager_bot = dynamic_loader.get_bot("manager")
+        if manager_bot:
+            await manager_bot.send_message(
+                config.GROUP_CHAT_ID,
+                f"❌ Ошибка агента {slug}: {exc}",
+            )
 
 
-@dp.message(F.chat.id == GROUP_CHAT_ID)
-async def on_group_message(message: Message) -> None:
-    # Игнорируем сообщения от самих ботов
-    if message.from_user and message.from_user.id in _bot_ids:
-        return
-    # Игнорируем пустые сообщения
-    if not message.text:
+async def on_message(message: Message) -> None:
+    """
+    Главный обработчик входящих сообщений в группе.
+    Маршрутизирует между прямым обращением к агенту и общим pipeline.
+    """
+    # Пропускаем сообщения от самих ботов
+    if message.from_user and message.from_user.id in dynamic_loader.get_all_bot_ids():
         return
 
-    asyncio.create_task(run_pipeline(message.text))
+    # Пропускаем если нет полезного контента
+    has_content = (
+        message.text
+        or message.photo
+        or message.voice
+        or message.document
+    )
+    if not has_content:
+        return
 
+    # Пропускаем команды (обрабатываются в commands.py)
+    if message.text and message.text.startswith("/"):
+        return
 
-async def start() -> None:
-    # Получаем ID всех ботов, чтобы не реагировать на их сообщения
-    for bot in (manager_bot, researcher_bot, analyst_bot):
-        info = await bot.get_me()
-        _bot_ids.add(info.id)
-        logger.info("Bot ready: @%s (id=%d)", info.username, info.id)
+    # Определяем какому боту пришло сообщение
+    bot_id = message.bot.id if message.bot else 0
+    receiving_slug = dynamic_loader.get_slug_by_bot_id(bot_id)
 
-    # Запускаем polling только через manager_bot — он слушает группу
-    await dp.start_polling(manager_bot, handle_signals=False)
+    # Если сообщение пришло не менеджеру — прямое обращение к агенту
+    if receiving_slug and receiving_slug != "manager":
+        asyncio.create_task(handle_direct_mention(receiving_slug, message))
+        return
+
+    manager_bot = dynamic_loader.get_bot("manager")
+    if not manager_bot:
+        logger.error("Manager bot not found")
+        return
+
+    image_b64 = None
+    task = ""
+
+    # Обрабатываем голосовые сообщения
+    if message.voice:
+        text = await media.voice_to_text(manager_bot, message.voice)
+        if text is None:
+            await manager_bot.send_message(
+                config.GROUP_CHAT_ID,
+                "❌ Не удалось распознать голосовое сообщение. Проверьте OPENAI_API_KEY.",
+            )
+            return
+        task = text
+        await manager_bot.send_message(
+            config.GROUP_CHAT_ID,
+            f"🎤 Распознал: {text}\nОбрабатываю...",
+        )
+
+    # Обрабатываем фото
+    elif message.photo:
+        image_b64 = await media.photo_to_base64(manager_bot, message.photo[-1])
+        task = message.caption or "Что сделать с этим изображением?"
+
+    # Обрабатываем документы
+    elif message.document:
+        text = await media.document_to_text(manager_bot, message.document)
+        if text is None:
+            await manager_bot.send_message(
+                config.GROUP_CHAT_ID,
+                "❌ Не могу прочитать этот файл. Поддерживаются только текстовые файлы.",
+            )
+            return
+        task = text
+
+    # Обычный текст
+    elif message.text:
+        task = message.text
+
+    if not task:
+        return
+
+    asyncio.create_task(run_pipeline(message, task, image_b64))
