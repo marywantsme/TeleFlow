@@ -24,7 +24,13 @@ AGENT_EMOJI = {
 
 def setup(dp: Dispatcher) -> None:
     """Регистрирует основной обработчик сообщений."""
-    dp.message.register(on_message, F.chat.id == config.GROUP_CHAT_ID)
+    # Фильтр исключает команды — они обрабатываются в commands.py
+    # ~F.text.startswith("/") пропускает None (фото, голосовые) как True
+    dp.message.register(
+        on_message,
+        F.chat.id == config.GROUP_CHAT_ID,
+        ~F.text.startswith("/"),
+    )
 
 
 async def run_pipeline(message: Message, task: str, image_b64: str = None) -> None:

@@ -24,9 +24,9 @@ async def main():
     await init_db()
     await seed_default_agents()
 
-    # Регистрируем обработчики
-    coordinator.setup(dp)
+    # Команды регистрируем первыми — они имеют приоритет над общим хендлером
     commands.setup(dp)
+    coordinator.setup(dp)
 
     # Устанавливаем Dispatcher для динамического загрузчика
     dynamic_loader.set_dispatcher(dp)
