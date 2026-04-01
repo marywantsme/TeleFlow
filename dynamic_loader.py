@@ -113,8 +113,11 @@ async def _run_polling(bot: Bot, slug: str) -> None:
             )
             for update in updates:
                 offset = update.update_id + 1
-                # Пропускаем голосовые — их обрабатывает только менеджер
-                if update.message and update.message.voice:
+                msg = update.message
+                # Не-менеджеры игнорируют команды и голосовые
+                if msg and msg.voice:
+                    continue
+                if msg and msg.text and msg.text.startswith("/"):
                     continue
                 asyncio.create_task(_dp.feed_update(bot, update))
 
