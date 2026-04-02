@@ -108,9 +108,14 @@ async def seed_default_agents() -> None:
     from database import seed_tools, assign_tool_to_agent
     await seed_tools(DEFAULT_TOOLS)
 
-    # Assign tools to researcher: web_search
+    # Researcher: web_search
     researcher = await get_agent_by_slug("researcher")
     if researcher:
         await assign_tool_to_agent(researcher["id"], "web_search")
+
+    # Analyst: image_generation (отвечает на запросы "нарисуй/сгенерируй")
+    analyst = await get_agent_by_slug("analyst")
+    if analyst:
+        await assign_tool_to_agent(analyst["id"], "image_generation")
 
     # Analyst gets text from researcher — no tools assigned by default

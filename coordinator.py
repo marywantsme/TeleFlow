@@ -10,6 +10,7 @@ import database
 import dynamic_loader
 import agents as agents_module
 import media
+from tools import run_tool, is_available
 from utils import typing_while
 
 logger = logging.getLogger(__name__)
@@ -29,7 +30,8 @@ def setup(dp: Dispatcher) -> None:
     dp.message.register(
         on_message,
         F.chat.id == config.GROUP_CHAT_ID,
-        ~F.text.startswith("/"),
+        # Команды исключаем только если text не None, иначе пропускаем фото/голос/документы
+        F.text.is_(None) | ~F.text.startswith("/"),
         StateFilter(None),  # Не запускать пайплайн если у пользователя активен FSM-диалог
     )
 
@@ -126,11 +128,9 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
             agent_tool_names = [t["name"] for t in agent_tool_list]
 
             web_results = None
-            if "web_search" in agent_tool_names:
-                from tools import run_tool, is_available
-                if is_available("web_search"):
-                    result_dict = await run_tool("web_search", query=task_for_agent)
-                    web_results = result_dict.get("data")
+            if "web_search" in agent_tool_names and is_available("web_search"):
+                result_dict = await run_tool("web_search", query=task_for_agent)
+                web_results = result_dict.get("data")
 
             # Сохраняем пользовательский запрос как входящий контекст агента
             await database.save_agent_message(task_id, slug, "user", task_for_agent)
@@ -170,19 +170,17 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
                 await agent_bot.send_message(chat_id, f"{emoji} {result}")
 
             # Если у агента есть инструмент генерации изображений — проверяем нужна ли генерация
-            if "image_generation" in agent_tool_names:
-                from tools import run_tool, is_available
-                if is_available("image_generation"):
-                    gen_keywords = ["нарисуй", "сгенерируй", "создай изображение", "generate image", "draw", "картинку", "изображение", "фото"]
-                    if any(kw in task.lower() for kw in gen_keywords):
-                        await agent_bot.send_message(chat_id, "🎨 Генерирую изображение...")
-                        img_result = await run_tool("image_generation", prompt=task)
-                        if img_result.get("type") == "photo" and img_result.get("data"):
-                            import io
-                            await agent_bot.send_photo(
-                                chat_id,
-                                photo=io.BytesIO(img_result["data"]),
-                            )
+            gen_keywords = ["нарисуй", "сгенерируй", "создай изображение", "generate image", "draw", "картинку"]
+            if (
+                "image_generation" in agent_tool_names
+                and is_available("image_generation")
+                and any(kw in task.lower() for kw in gen_keywords)
+            ):
+                import io
+                await agent_bot.send_message(chat_id, "🎨 Генерирую изображение...")
+                img_result = await run_tool("image_generation", prompt=task)
+                if img_result.get("type") == "photo" and img_result.get("data"):
+                    await agent_bot.send_photo(chat_id, photo=io.BytesIO(img_result["data"]))
 
             await asyncio.sleep(1.5)
 
@@ -236,9 +234,11 @@ async def handle_direct_mention(slug: str, message: Message) -> None:
 
     db_agent = await database.get_agent_by_slug(slug)
     task = message.text or message.caption or "Что сделать?"
+    user_id = message.from_user.id if message.from_user else 0
 
-    # Сохраняем пользовательское сообщение в контекст агента
-    await database.save_agent_message(0, slug, "user", task)
+    # Создаём полноценную задачу в БД — не task_id=0
+    task_id = await database.create_task(user_id, task)
+    await database.save_agent_message(task_id, slug, "user", task)
 
     try:
         result = await typing_while(
@@ -250,6 +250,8 @@ async def handle_direct_mention(slug: str, message: Message) -> None:
                 db_agent=db_agent,
             ),
         )
+        await database.save_agent_message(task_id, slug, "assistant", result)
+        await database.update_task_status(task_id, "done")
         emoji = AGENT_EMOJI.get(slug, "🤖")
         try:
             await agent_bot.send_message(
@@ -259,10 +261,9 @@ async def handle_direct_mention(slug: str, message: Message) -> None:
             )
         except Exception:
             await agent_bot.send_message(config.GROUP_CHAT_ID, f"{emoji} {result}")
-        # Сохраняем ответ агента в контекст
-        await database.save_agent_message(0, slug, "assistant", result)
     except Exception as exc:
         logger.error("Direct mention error for agent '%s': %s", slug, exc)
+        await database.update_task_status(task_id, "error")
         manager_bot = dynamic_loader.get_bot("manager")
         if manager_bot:
             await manager_bot.send_message(

@@ -192,9 +192,7 @@ async def upsert_agent(
             (slug, name, token, system_prompt, description, capabilities, username),
         )
         await db.commit()
-        # Получаем id записи
-        if cursor.lastrowid:
-            return cursor.lastrowid
+        # ON CONFLICT UPDATE не обновляет lastrowid — всегда запрашиваем напрямую
         row = await db.execute("SELECT id FROM agents_registry WHERE slug = ?", (slug,))
         result = await row.fetchone()
         return result[0] if result else 0
@@ -255,8 +253,8 @@ async def get_agent_tools(agent_id: int) -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """SELECT t.* FROM tools t
-               JOIN agent_tools at ON t.id = at.tool_id
-               WHERE at.agent_id = ? AND t.is_active = 1""",
+               JOIN agent_tools agt ON t.id = agt.tool_id
+               WHERE agt.agent_id = ? AND t.is_active = 1""",
             (agent_id,)
         )
         rows = await cursor.fetchall()

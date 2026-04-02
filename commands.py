@@ -203,11 +203,30 @@ async def handle_agent_description(message: Message, state: FSMContext) -> None:
     if not bot:
         return
     if not message.text or not message.text.strip():
-        await bot.send_message(config.GROUP_CHAT_ID, "❌ Описание не может быть пустым.")
+        await bot.send_message(config.GROUP_CHAT_ID, "❌ Текст не может быть пустым.")
         return
 
-    await bot.send_message(config.GROUP_CHAT_ID, "⚙️ Генерирую спецификацию...")
-    await _generate_and_show_spec(message.text, state, bot)
+    data = await state.get_data()
+    editing_slug = data.get("editing_slug")
+
+    if editing_slug:
+        # Режим редактирования — обновляем промпт существующего агента
+        try:
+            await database.update_agent_prompt(editing_slug, message.text.strip())
+            await state.clear()
+            await bot.send_message(
+                config.GROUP_CHAT_ID,
+                f"✅ Промпт агента <code>{editing_slug}</code> обновлён.",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.error("Edit agent prompt failed for '%s': %s", editing_slug, exc)
+            await state.clear()
+            await bot.send_message(config.GROUP_CHAT_ID, f"❌ Ошибка: {exc}")
+    else:
+        # Режим добавления — генерируем спецификацию нового агента
+        await bot.send_message(config.GROUP_CHAT_ID, "⚙️ Генерирую спецификацию...")
+        await _generate_and_show_spec(message.text, state, bot)
 
 
 @router.message(
