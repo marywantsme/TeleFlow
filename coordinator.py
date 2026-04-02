@@ -3,7 +3,7 @@ import logging
 
 from aiogram import Dispatcher, F
 from aiogram.filters import StateFilter
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, Message
 
 import config
 import database
@@ -99,6 +99,7 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
                 description=suggestion,
                 system_prompt=route_result.get("system_prompt", ""),
                 capabilities=route_result.get("capabilities", "text"),
+                original_task=task,  # исходный запрос пользователя
             )
             text = (
                 f"💡 Для этой задачи нужен новый агент!\n\n"
@@ -142,57 +143,71 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
             # Сохраняем пользовательский запрос как входящий контекст агента
             await database.save_agent_message(task_id, slug, "user", task_for_agent)
 
-            # Выполняем агента с индикатором печати
-            try:
-                result = await typing_while(
-                    agent_bot,
-                    chat_id,
-                    agents_module.run_agent_by_slug(
-                        slug=slug,
-                        task=task_for_agent,
-                        db_agent=db_agent,
-                        image_b64=image_b64,
-                        web_results=web_results,
-                    ),
-                )
-            except Exception as exc:
-                logger.error("Agent '%s' error: %s", slug, exc)
-                await manager_bot.send_message(chat_id, f"❌ Ошибка агента {slug}: {exc}")
-                await database.update_task_status(task_id, "error")
-                return
+            has_image_tool = "image_generation" in agent_tool_names and is_available("image_generation")
+            gen_keywords = ["нарисуй", "сгенерируй", "создай изображение", "generate image", "draw", "картинку", "нарисовать"]
 
-            # Сохраняем результат в БД
-            await database.save_agent_message(task_id, slug, "assistant", result)
+            if has_image_tool and any(kw in task.lower() for kw in gen_keywords):
+                # Агент с image_generation — Claude генерирует промпт, мы отправляем только фото
+                logger.info("Task #%d: step %s START (image_generation)", task_id, slug)
+                try:
+                    # Claude возвращает только промпт для DALL-E — без вопросов и пояснений
+                    image_prompt = await typing_while(
+                        agent_bot,
+                        chat_id,
+                        agents_module.run_agent_by_slug(
+                            slug=slug,
+                            task=task_for_agent,
+                            db_agent=db_agent,
+                        ),
+                    )
+                    logger.info("Task #%d: step %s END (got prompt)", task_id, slug)
+                    await agent_bot.send_message(chat_id, "🎨 Генерирую изображение...")
+                    img_result = await run_tool("image_generation", prompt=image_prompt)
+                    if img_result.get("type") == "photo" and img_result.get("data"):
+                        photo = BufferedInputFile(file=img_result["data"], filename="generated.png")
+                        await agent_bot.send_photo(chat_id, photo=photo)
+                        await database.save_agent_message(task_id, slug, "assistant", image_prompt)
+                        task_for_agent = image_prompt
+                    else:
+                        # Инструмент вернул ошибку — отправляем текст
+                        err = img_result.get("data", "Ошибка генерации")
+                        await agent_bot.send_message(chat_id, str(err))
+                except Exception as exc:
+                    logger.error("Task #%d: agent '%s' image error: %s", task_id, slug, exc)
+                    await manager_bot.send_message(chat_id, f"❌ Ошибка генерации: {exc}")
+                    await database.update_task_status(task_id, "error")
+                    return
+            else:
+                # Обычный текстовый агент
+                logger.info("Task #%d: step %s START", task_id, slug)
+                try:
+                    result = await typing_while(
+                        agent_bot,
+                        chat_id,
+                        agents_module.run_agent_by_slug(
+                            slug=slug,
+                            task=task_for_agent,
+                            db_agent=db_agent,
+                            image_b64=image_b64,
+                            web_results=web_results,
+                        ),
+                    )
+                except Exception as exc:
+                    logger.error("Task #%d: agent '%s' error: %s", task_id, slug, exc)
+                    await manager_bot.send_message(chat_id, f"❌ Ошибка агента {slug}: {exc}")
+                    await database.update_task_status(task_id, "error")
+                    return
 
-            # Отправляем результат от имени бота агента
-            emoji = AGENT_EMOJI.get(slug, "🤖")
-            try:
-                await agent_bot.send_message(
-                    chat_id,
-                    f"{emoji} {result}",
-                    parse_mode="HTML",
-                )
-            except Exception:
-                # Если HTML не парсится — отправляем без форматирования
-                await agent_bot.send_message(chat_id, f"{emoji} {result}")
-
-            # Если у агента есть инструмент генерации изображений — проверяем нужна ли генерация
-            gen_keywords = ["нарисуй", "сгенерируй", "создай изображение", "generate image", "draw", "картинку"]
-            if (
-                "image_generation" in agent_tool_names
-                and is_available("image_generation")
-                and any(kw in task.lower() for kw in gen_keywords)
-            ):
-                import io
-                await agent_bot.send_message(chat_id, "🎨 Генерирую изображение...")
-                img_result = await run_tool("image_generation", prompt=task)
-                if img_result.get("type") == "photo" and img_result.get("data"):
-                    await agent_bot.send_photo(chat_id, photo=io.BytesIO(img_result["data"]))
+                logger.info("Task #%d: step %s END", task_id, slug)
+                await database.save_agent_message(task_id, slug, "assistant", result)
+                emoji = AGENT_EMOJI.get(slug, "🤖")
+                try:
+                    await agent_bot.send_message(chat_id, f"{emoji} {result}", parse_mode="HTML")
+                except Exception:
+                    await agent_bot.send_message(chat_id, f"{emoji} {result}")
+                task_for_agent = result
 
             await asyncio.sleep(1.5)
-
-            # Результат текущего агента передаём следующему
-            task_for_agent = result
 
         # Финальный брифинг менеджера (только для цепочки)
         if route == "chain" and len(agent_slugs) > 1:
@@ -284,11 +299,15 @@ async def on_message(message: Message) -> None:
     Главный обработчик входящих сообщений в группе.
     Маршрутизирует между прямым обращением к агенту и общим pipeline.
     """
-    # Пропускаем сообщения от самих ботов
-    if message.from_user and message.from_user.id in dynamic_loader.get_all_bot_ids():
+    # Пропускаем service messages (join, leave, pin и тд) — у них нет from_user или нет контента
+    if not message.from_user:
         return
 
-    # Пропускаем если нет полезного контента
+    # Пропускаем сообщения от самих ботов
+    if message.from_user.id in dynamic_loader.get_all_bot_ids():
+        return
+
+    # Пропускаем если нет полезного контента (service messages, stickers, etc.)
     has_content = (
         message.text
         or message.photo
@@ -365,3 +384,15 @@ async def on_message(message: Message) -> None:
         return
 
     asyncio.create_task(run_pipeline(message, task, image_b64))
+
+
+async def run_pipeline_from_task(user_id: int, task: str) -> None:
+    """Запускает пайплайн напрямую по тексту задачи (без объекта Message)."""
+
+    class _FakeUser:
+        id = user_id
+
+    class _FakeMessage:
+        from_user = _FakeUser()
+
+    await run_pipeline(_FakeMessage(), task)

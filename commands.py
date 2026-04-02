@@ -6,6 +6,7 @@ from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.enums import ContentType
 from aiogram.types import Message
 
 import config
@@ -185,6 +186,7 @@ async def cmd_addagent(message: Message, state: FSMContext) -> None:
             prefill_system_prompt=pending.get("system_prompt", ""),
             prefill_capabilities=pending.get("capabilities", "text"),
             pending_id=pending["id"],
+            original_task=pending.get("original_task", ""),
         )
     else:
         # Сценарий Б: спрашиваем описание
@@ -236,11 +238,15 @@ async def handle_agent_description(message: Message, state: FSMContext) -> None:
     StateFilter(AddAgentStates.awaiting_token),
 )
 async def handle_agent_token(message: Message, state: FSMContext) -> None:
+    # Игнорируем service messages (добавление в группу, pin и тд) — у них нет текста
+    if message.content_type != "text" or not message.text:
+        return
+
     bot = _manager()
     if not bot:
         return
 
-    token_value = (message.text or "").strip()
+    token_value = message.text.strip()
     if not token_value:
         await bot.send_message(config.GROUP_CHAT_ID, "❌ Токен не может быть пустым.")
         return
@@ -287,6 +293,21 @@ async def handle_agent_token(message: Message, state: FSMContext) -> None:
         )
         await state.clear()
 
+        # Если есть исходная задача — запускаем пайплайн автоматически
+        original_task = data.get("original_task", "")
+        if original_task:
+            await bot.send_message(
+                config.GROUP_CHAT_ID,
+                "▶️ Выполняю исходную задачу...",
+            )
+            import coordinator as _coordinator
+            asyncio.create_task(
+                _coordinator.run_pipeline_from_task(
+                    user_id=message.from_user.id if message.from_user else 0,
+                    task=original_task,
+                )
+            )
+
     except Exception as exc:
         logger.error("Token registration failed: %s", exc)
         await bot.send_message(config.GROUP_CHAT_ID, f"❌ Неверный токен или ошибка: {exc}")
@@ -300,6 +321,7 @@ async def _generate_and_show_spec(
     prefill_system_prompt: str = "",
     prefill_capabilities: str = "text",
     pending_id: int = 0,
+    original_task: str = "",
 ) -> None:
     """Генерирует спецификацию агента через Claude и показывает инструкцию для BotFather.
 
@@ -381,7 +403,7 @@ async def _generate_and_show_spec(
 
         # Переходим в состояние ожидания токена
         await state.set_state(AddAgentStates.awaiting_token)
-        await state.update_data(spec=spec, slug=slug, pending_id=pending_id)
+        await state.update_data(spec=spec, slug=slug, pending_id=pending_id, original_task=original_task)
 
         missing_note = ""
         if missing_tools:

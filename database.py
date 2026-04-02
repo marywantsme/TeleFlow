@@ -67,6 +67,7 @@ async def init_db() -> None:
                 description TEXT NOT NULL,
                 system_prompt TEXT,
                 capabilities TEXT DEFAULT 'text',
+                original_task TEXT DEFAULT '',
                 suggested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -291,14 +292,15 @@ async def clear_agent_tools(agent_id: int) -> None:
         await db.commit()
 
 
-async def save_pending_agent(name: str, description: str, system_prompt: str, capabilities: str) -> int:
+async def save_pending_agent(
+    name: str, description: str, system_prompt: str, capabilities: str, original_task: str = ""
+) -> int:
     """Сохраняет предложение агента от менеджера. Заменяет предыдущие записи."""
     async with aiosqlite.connect(DB_PATH) as db:
-        # Удаляем устаревшие предложения перед сохранением нового
         await db.execute("DELETE FROM pending_agents")
         cursor = await db.execute(
-            "INSERT INTO pending_agents (name, description, system_prompt, capabilities) VALUES (?, ?, ?, ?)",
-            (name, description, system_prompt, capabilities),
+            "INSERT INTO pending_agents (name, description, system_prompt, capabilities, original_task) VALUES (?, ?, ?, ?, ?)",
+            (name, description, system_prompt, capabilities, original_task),
         )
         await db.commit()
         return cursor.lastrowid
