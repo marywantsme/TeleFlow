@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from aiogram import Dispatcher, F
+from aiogram.filters import StateFilter
 from aiogram.types import Message
 
 import config
@@ -30,6 +31,7 @@ def setup(dp: Dispatcher) -> None:
         on_message,
         F.chat.id == config.GROUP_CHAT_ID,
         ~F.text.startswith("/"),
+        StateFilter(None),  # Не запускать пайплайн если у пользователя активен FSM-диалог
     )
 
 
