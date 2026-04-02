@@ -43,6 +43,23 @@ async def init_db() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tools (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE,
+                description TEXT,
+                function_name TEXT,
+                required_env_key TEXT,
+                is_active INTEGER DEFAULT 1
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_tools (
+                agent_id INTEGER,
+                tool_id INTEGER,
+                PRIMARY KEY (agent_id, tool_id)
+            )
+        """)
         await db.commit()
     logger.info("Database initialized: %s", DB_PATH)
 
@@ -209,3 +226,58 @@ async def count_tasks() -> int:
         cursor = await db.execute("SELECT COUNT(*) FROM tasks")
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+
+async def seed_tools(tools_list: list[dict]) -> None:
+    """Добавляет инструменты в реестр если их нет."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for tool in tools_list:
+            await db.execute(
+                """INSERT OR IGNORE INTO tools (name, description, function_name, required_env_key, is_active)
+                   VALUES (?, ?, ?, ?, 1)""",
+                (tool["name"], tool["description"], tool["function_name"], tool["required_env_key"]),
+            )
+        await db.commit()
+
+
+async def get_all_tools() -> list[dict]:
+    """Возвращает все активные инструменты из реестра."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM tools WHERE is_active = 1")
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_agent_tools(agent_id: int) -> list[dict]:
+    """Возвращает инструменты привязанные к агенту."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT t.* FROM tools t
+               JOIN agent_tools at ON t.id = at.tool_id
+               WHERE at.agent_id = ? AND t.is_active = 1""",
+            (agent_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def assign_tool_to_agent(agent_id: int, tool_name: str) -> None:
+    """Привязывает инструмент к агенту по имени инструмента."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT id FROM tools WHERE name = ?", (tool_name,))
+        row = await cursor.fetchone()
+        if row:
+            await db.execute(
+                "INSERT OR IGNORE INTO agent_tools (agent_id, tool_id) VALUES (?, ?)",
+                (agent_id, row[0])
+            )
+            await db.commit()
+
+
+async def clear_agent_tools(agent_id: int) -> None:
+    """Удаляет все привязки инструментов агента."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM agent_tools WHERE agent_id = ?", (agent_id,))
+        await db.commit()

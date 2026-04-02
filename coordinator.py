@@ -10,7 +10,6 @@ import database
 import dynamic_loader
 import agents as agents_module
 import media
-import web_search
 from utils import typing_while
 
 logger = logging.getLogger(__name__)
@@ -121,11 +120,17 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
 
             db_agent = await database.get_agent_by_slug(slug)
 
-            # Проверяем нужен ли веб-поиск
-            capabilities = db_agent.get("capabilities", "text") if db_agent else "text"
+            # Получаем инструменты агента из БД
+            agent_id = db_agent["id"] if db_agent else None
+            agent_tool_list = await database.get_agent_tools(agent_id) if agent_id else []
+            agent_tool_names = [t["name"] for t in agent_tool_list]
+
             web_results = None
-            if "web_search" in capabilities:
-                web_results = await web_search.search_web(task)
+            if "web_search" in agent_tool_names:
+                from tools import run_tool, is_available
+                if is_available("web_search"):
+                    result_dict = await run_tool("web_search", query=task_for_agent)
+                    web_results = result_dict.get("data")
 
             # Сохраняем пользовательский запрос как входящий контекст агента
             await database.save_agent_message(task_id, slug, "user", task_for_agent)
@@ -163,6 +168,21 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
             except Exception:
                 # Если HTML не парсится — отправляем без форматирования
                 await agent_bot.send_message(chat_id, f"{emoji} {result}")
+
+            # Если у агента есть инструмент генерации изображений — проверяем нужна ли генерация
+            if "image_generation" in agent_tool_names:
+                from tools import run_tool, is_available
+                if is_available("image_generation"):
+                    gen_keywords = ["нарисуй", "сгенерируй", "создай изображение", "generate image", "draw", "картинку", "изображение", "фото"]
+                    if any(kw in task.lower() for kw in gen_keywords):
+                        await agent_bot.send_message(chat_id, "🎨 Генерирую изображение...")
+                        img_result = await run_tool("image_generation", prompt=task)
+                        if img_result.get("type") == "photo" and img_result.get("data"):
+                            import io
+                            await agent_bot.send_photo(
+                                chat_id,
+                                photo=io.BytesIO(img_result["data"]),
+                            )
 
             await asyncio.sleep(1.5)
 

@@ -31,6 +31,12 @@ MANAGER_FINAL_SYSTEM = """Ты — менеджер команды в рабоч
 Можно один-два эмодзи для живости.
 Отвечай на русском."""
 
+DEFAULT_TOOLS = [
+    {"name": "web_search", "description": "Поиск актуальной информации", "function_name": "web_search", "required_env_key": "TAVILY_API_KEY"},
+    {"name": "image_generation", "description": "Генерация изображений (DALL-E 3)", "function_name": "generate_image", "required_env_key": "OPENAI_API_KEY"},
+    {"name": "voice_transcription", "description": "Распознавание голоса (Whisper)", "function_name": "transcribe_voice", "required_env_key": "OPENAI_API_KEY"},
+]
+
 DEFAULT_AGENTS = {
     "researcher": {
         "name": "TeleFlow Researcher",
@@ -98,3 +104,13 @@ async def seed_default_agents() -> None:
         username="",
     )
     logger.info("Manager seeded/updated")
+
+    from database import seed_tools, assign_tool_to_agent
+    await seed_tools(DEFAULT_TOOLS)
+
+    # Assign tools to researcher: web_search
+    researcher = await get_agent_by_slug("researcher")
+    if researcher:
+        await assign_tool_to_agent(researcher["id"], "web_search")
+
+    # Analyst gets text from researcher — no tools assigned by default

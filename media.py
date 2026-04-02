@@ -1,24 +1,12 @@
 import base64
 import io
 import logging
-import os
 from typing import Optional
 
 from aiogram import Bot
 from aiogram.types import PhotoSize, Document, Voice
 
-from config import OPENAI_API_KEY
-
 logger = logging.getLogger(__name__)
-
-# Проверяем доступность openai
-try:
-    import openai as _openai
-    OPENAI_AVAILABLE = True
-    logger.info("OpenAI available for voice transcription")
-except ImportError:
-    OPENAI_AVAILABLE = False
-    logger.warning("OpenAI not installed. Voice transcription disabled.")
 
 
 async def photo_to_base64(bot: Bot, photo: PhotoSize) -> Optional[str]:
@@ -62,48 +50,21 @@ async def document_to_text(bot: Bot, document: Document) -> Optional[str]:
 
 
 async def voice_to_text(bot: Bot, voice: Voice) -> Optional[str]:
-    """
-    Транскрибирует голосовое сообщение через OpenAI Whisper.
-    """
-    if not OPENAI_AVAILABLE:
-        logger.info("OpenAI not available for voice transcription")
-        return None
-
-    if not OPENAI_API_KEY:
-        logger.info("OPENAI_API_KEY not set, skipping voice transcription")
-        return None
-
-    tmp_path = f"/tmp/voice_{voice.file_id}.ogg"
+    """Транскрибирует голосовое через tools.py"""
     try:
-        # Скачиваем голосовое сообщение
         file_info = await bot.get_file(voice.file_id)
-        file_bytes = await bot.download_file(file_info.file_path)
-        if hasattr(file_bytes, "read"):
-            data = file_bytes.read()
+        file_bytes_io = await bot.download_file(file_info.file_path)
+        if hasattr(file_bytes_io, "read"):
+            data = file_bytes_io.read()
         else:
-            data = bytes(file_bytes)
+            data = bytes(file_bytes_io)
 
-        # Сохраняем во временный файл
-        with open(tmp_path, "wb") as f:
-            f.write(data)
-
-        # Транскрибируем через Whisper
-        client = _openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-        with open(tmp_path, "rb") as f:
-            transcript = await client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="ru",
-            )
-        return transcript.text
-
+        from tools import run_tool, is_available
+        if not is_available("voice_transcription"):
+            logger.info("voice_transcription not available")
+            return None
+        result = await run_tool("voice_transcription", file_bytes=data, file_id=voice.file_id)
+        return result.get("data")
     except Exception as exc:
         logger.error("Voice transcription failed: %s", exc)
         return None
-    finally:
-        # Удаляем временный файл
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass

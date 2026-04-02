@@ -302,8 +302,32 @@ async def _generate_and_show_spec(description: str, state: FSMContext, bot) -> N
             capabilities=spec.get("capabilities", "text"),
             username=username,
         )
+
+        # Автоматически определяем инструменты по описанию
+        from tools import TOOLS, is_available
+        from database import assign_tool_to_agent, get_agent_by_slug as _get_by_slug
+        saved_agent = await _get_by_slug(slug)
+        missing_tools = []
+        if saved_agent:
+            tool_keywords = {
+                "web_search": ["ищет", "поиск", "search", "интернет", "актуальн"],
+                "image_generation": ["генерирует", "рисует", "картинк", "изображен", "image", "draw"],
+            }
+            desc_lower = description.lower()
+            for tool_name, keywords in tool_keywords.items():
+                if any(kw in desc_lower for kw in keywords):
+                    if is_available(tool_name):
+                        await assign_tool_to_agent(saved_agent["id"], tool_name)
+                    else:
+                        missing_tools.append(tool_name)
+
         await state.set_state(AddAgentStates.awaiting_token)
         await state.update_data(spec=spec, slug=slug)
+
+        missing_note = ""
+        if missing_tools:
+            tools_str = ", ".join(missing_tools)
+            missing_note = f"\n\n⚠️ Инструменты не активны (нет API ключей): <code>{tools_str}</code>"
 
         await bot.send_message(
             config.GROUP_CHAT_ID,
@@ -314,7 +338,8 @@ async def _generate_and_show_spec(description: str, state: FSMContext, bot) -> N
             f"1. /newbot\n"
             f"2. Имя: <code>{name}</code>\n"
             f"3. Username: <code>{username}</code>\n"
-            f"4. Скопируй токен и отправь его сюда ответным сообщением.",
+            f"4. Скопируй токен и отправь его сюда ответным сообщением."
+            f"{missing_note}",
             parse_mode="HTML",
         )
     except Exception as exc:
