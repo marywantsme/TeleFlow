@@ -9,7 +9,9 @@
       "Bash(git push:*)",
       "Bash(python3 -c \"import coordinator, dynamic_loader; print\\(''OK''\\)\")",
       "Bash(python3 -c \"import coordinator, commands; print\\(''OK''\\)\")",
-      "Bash(python3 -c \"import coordinator, commands, agents_config; print\\(''OK''\\)\")"
+      "Bash(python3 -c \"import coordinator, commands, agents_config; print\\(''OK''\\)\")",
+      "Bash(python3 -c \"import coordinator, commands, database, agents_config, tools; print\\(''OK''\\)\")",
+      "Bash(git rm:*)"
     ]
   }
 }
