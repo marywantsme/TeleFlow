@@ -45,9 +45,9 @@ async def main():
             )
             continue
 
-        # Менеджер использует dp.start_polling (не кастомный цикл)
-        start_pol = slug != "manager"
-        await dynamic_loader.add_bot(slug, token, start_polling=start_pol)
+        # Только manager получает апдейты через dp.start_polling.
+        # Остальные боты — только Bot-инстансы для отправки сообщений.
+        await dynamic_loader.add_bot(slug, token, start_polling=False)
 
     manager_bot = dynamic_loader.get_bot("manager")
     if not manager_bot:

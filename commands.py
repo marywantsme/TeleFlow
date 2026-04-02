@@ -283,7 +283,7 @@ async def cmd_token(message: Message) -> None:
         bot = dynamic_loader.get_bot(slug)
         if bot:
             await dynamic_loader.remove_bot(slug)
-        await dynamic_loader.add_bot(slug, token_value, start_polling=True)
+        await dynamic_loader.add_bot(slug, token_value, start_polling=False)
 
         # Приветственное сообщение от нового бота
         new_bot = dynamic_loader.get_bot(slug)
