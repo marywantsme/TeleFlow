@@ -60,6 +60,16 @@ async def init_db() -> None:
                 PRIMARY KEY (agent_id, tool_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_agents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                system_prompt TEXT,
+                capabilities TEXT DEFAULT 'text',
+                suggested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
     logger.info("Database initialized: %s", DB_PATH)
 
@@ -278,4 +288,37 @@ async def clear_agent_tools(agent_id: int) -> None:
     """Удаляет все привязки инструментов агента."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM agent_tools WHERE agent_id = ?", (agent_id,))
+        await db.commit()
+
+
+async def save_pending_agent(name: str, description: str, system_prompt: str, capabilities: str) -> int:
+    """Сохраняет предложение агента от менеджера. Заменяет предыдущие записи."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Удаляем устаревшие предложения перед сохранением нового
+        await db.execute("DELETE FROM pending_agents")
+        cursor = await db.execute(
+            "INSERT INTO pending_agents (name, description, system_prompt, capabilities) VALUES (?, ?, ?, ?)",
+            (name, description, system_prompt, capabilities),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_fresh_pending_agent() -> Optional[dict]:
+    """Возвращает актуальное предложение агента (не старше 30 минут) или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT * FROM pending_agents
+               WHERE datetime(suggested_at) > datetime('now', '-30 minutes')
+               ORDER BY suggested_at DESC LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def delete_pending_agent(pending_id: int) -> None:
+    """Удаляет использованное предложение агента."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM pending_agents WHERE id = ?", (pending_id,))
         await db.commit()

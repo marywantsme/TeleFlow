@@ -93,6 +93,13 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
 
         if route == "suggest_agent":
             suggestion = route_result.get("description", "")
+            # Сохраняем предложение в БД — /addagent подхватит его автоматически
+            await database.save_pending_agent(
+                name=route_result.get("name", "Новый агент"),
+                description=suggestion,
+                system_prompt=route_result.get("system_prompt", ""),
+                capabilities=route_result.get("capabilities", "text"),
+            )
             text = (
                 f"💡 Для этой задачи нужен новый агент!\n\n"
                 f"<i>{suggestion}</i>\n\n"

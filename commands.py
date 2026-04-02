@@ -168,24 +168,26 @@ async def cmd_addagent(message: Message, state: FSMContext) -> None:
     if not bot:
         return
 
-    # Проверяем последние сообщения менеджера — вдруг он уже предложил агента
-    recent = await database.get_agent_context("manager", limit=3)
-    auto_desc = None
-    for msg in reversed(recent):
-        content = msg.get("content", "")
-        if "нужен новый агент" in content.lower() or "suggest_agent" in content.lower():
-            # Берём описание из предложения менеджера
-            auto_desc = content
-            break
-
-    if auto_desc:
-        # Пропускаем шаг описания — сразу генерируем спецификацию
+    # Сценарий А: проверяем свежее предложение из pending_agents (не старше 30 мин)
+    pending = await database.get_fresh_pending_agent()
+    if pending:
         await bot.send_message(
             config.GROUP_CHAT_ID,
-            "💡 Вижу, что уже предложил агента. Генерирую спецификацию...",
+            f"💡 Вижу, что уже предложил агента — <b>{pending['name']}</b>.\n"
+            f"<i>{pending['description']}</i>\n\nГенерирую спецификацию...",
+            parse_mode="HTML",
         )
-        await _generate_and_show_spec(auto_desc, state, bot)
+        await _generate_and_show_spec(
+            pending["description"],
+            state,
+            bot,
+            prefill_name=pending["name"],
+            prefill_system_prompt=pending.get("system_prompt", ""),
+            prefill_capabilities=pending.get("capabilities", "text"),
+            pending_id=pending["id"],
+        )
     else:
+        # Сценарий Б: спрашиваем описание
         await state.set_state(AddAgentStates.awaiting_description)
         await bot.send_message(
             config.GROUP_CHAT_ID,
@@ -273,6 +275,11 @@ async def handle_agent_token(message: Message, state: FSMContext) -> None:
                 parse_mode="HTML",
             )
 
+        # Удаляем использованное предложение из pending_agents
+        pending_id = data.get("pending_id", 0)
+        if pending_id:
+            await database.delete_pending_agent(pending_id)
+
         await bot.send_message(
             config.GROUP_CHAT_ID,
             f"✅ Агент <code>{slug}</code> (@{me.username}) подключён!",
@@ -285,79 +292,113 @@ async def handle_agent_token(message: Message, state: FSMContext) -> None:
         await bot.send_message(config.GROUP_CHAT_ID, f"❌ Неверный токен или ошибка: {exc}")
 
 
-async def _generate_and_show_spec(description: str, state: FSMContext, bot) -> None:
-    """Генерирует спецификацию агента через Claude и показывает инструкцию для BotFather."""
-    try:
-        suffix = random_suffix(4)
-        prompt = (
-            f"Сгенерируй спецификацию Telegram-бота на основе описания:\n\n{description}\n\n"
-            f"Верни ТОЛЬКО JSON:\n"
-            f'{{"name": "Имя агента", "recommended_username": "teleflow_{suffix}bot", '
-            f'"system_prompt": "Системный промпт на русском", '
-            f'"description": "Краткое описание", "capabilities": "text"}}\n\n'
-            f"Username должен быть на латинице, заканчиваться на 'bot', содержать суффикс '{suffix}'."
-        )
-        raw = await agents_module.call_agent(
-            system_prompt="Ты — архитектор AI-агентов. Генерируй чёткие спецификации. Отвечай только JSON.",
-            user_content=prompt,
-        )
-        spec = extract_json(raw)
-        if not spec:
-            raise ValueError("Не удалось разобрать JSON спецификации")
+async def _generate_and_show_spec(
+    description: str,
+    state: FSMContext,
+    bot,
+    prefill_name: str = "",
+    prefill_system_prompt: str = "",
+    prefill_capabilities: str = "text",
+    pending_id: int = 0,
+) -> None:
+    """Генерирует спецификацию агента через Claude и показывает инструкцию для BotFather.
 
-        username = spec.get("recommended_username", f"teleflow_{suffix}bot")
-        name = spec.get("name", "Новый агент")
-        slug = username.rstrip("bot").rstrip("_").lower()
+    Если переданы prefill_* — используем их как базу, Claude только дополняет недостающее.
+    pending_id — id записи pending_agents, которую нужно удалить после генерации.
+    """
+    try:
+        suffix = random_suffix(3)
+
+        if prefill_name and prefill_system_prompt:
+            # Сценарий А: у нас уже есть данные от менеджера — генерируем только username
+            name = prefill_name
+            system_prompt = prefill_system_prompt
+            capabilities = prefill_capabilities
+            # Генерируем username из имени
+            base = name.lower().replace(" ", "_").replace("teleflow_", "")[:20]
+            username = f"teleflow_{base}_{suffix}_bot"
+            spec = {
+                "name": name,
+                "recommended_username": username,
+                "system_prompt": system_prompt,
+                "description": description,
+                "capabilities": capabilities,
+            }
+        else:
+            # Сценарий Б: генерируем полную спецификацию через Claude
+            prompt = (
+                f"Сгенерируй спецификацию Telegram-бота на основе описания:\n\n{description}\n\n"
+                f"Верни ТОЛЬКО JSON:\n"
+                f'{{"name": "Имя агента", "recommended_username": "teleflow_name_{suffix}_bot", '
+                f'"system_prompt": "Системный промпт на русском", '
+                f'"description": "Краткое описание", "capabilities": "text"}}\n\n'
+                f"Username: латиница, содержит суффикс '_{suffix}_bot'."
+            )
+            raw = await agents_module.call_agent(
+                system_prompt="Ты — архитектор AI-агентов. Отвечай только JSON.",
+                user_content=prompt,
+            )
+            spec = extract_json(raw)
+            if not spec:
+                raise ValueError("Не удалось разобрать JSON спецификации")
+            name = spec.get("name", "Новый агент")
+            username = spec.get("recommended_username", f"teleflow_agent_{suffix}_bot")
+
+        # Нормализуем username — должен заканчиваться на _bot
+        if not username.endswith("_bot") and not username.endswith("bot"):
+            username = username + "_bot"
+        slug = username.replace("_bot", "").replace("teleflow_", "").strip("_").lower()
         if not slug:
             slug = f"agent_{suffix}"
 
-        # Сохраняем черновик и переходим к ожиданию токена
+        # Сохраняем черновик в agents_registry
         await database.upsert_agent(
             slug=slug,
-            name=name,
+            name=spec["name"],
             token="",
             system_prompt=spec.get("system_prompt", ""),
-            description=spec.get("description", ""),
+            description=spec.get("description", description),
             capabilities=spec.get("capabilities", "text"),
             username=username,
         )
 
-        # Автоматически определяем инструменты по описанию
-        from tools import TOOLS, is_available
-        from database import assign_tool_to_agent, get_agent_by_slug as _get_by_slug
-        saved_agent = await _get_by_slug(slug)
+        # Автоматически привязываем инструменты по ключевым словам описания
+        from tools import is_available
+        saved_agent = await database.get_agent_by_slug(slug)
         missing_tools = []
         if saved_agent:
             tool_keywords = {
-                "web_search": ["ищет", "поиск", "search", "интернет", "актуальн"],
-                "image_generation": ["генерирует", "рисует", "картинк", "изображен", "image", "draw"],
+                "web_search": ["ищет", "поиск", "search", "интернет", "актуальн", "новост"],
+                "image_generation": ["генерирует", "рисует", "картинк", "изображен", "image", "draw", "визуал"],
             }
             desc_lower = description.lower()
             for tool_name, keywords in tool_keywords.items():
                 if any(kw in desc_lower for kw in keywords):
                     if is_available(tool_name):
-                        await assign_tool_to_agent(saved_agent["id"], tool_name)
+                        await database.assign_tool_to_agent(saved_agent["id"], tool_name)
                     else:
                         missing_tools.append(tool_name)
 
+        # Переходим в состояние ожидания токена
         await state.set_state(AddAgentStates.awaiting_token)
-        await state.update_data(spec=spec, slug=slug)
+        await state.update_data(spec=spec, slug=slug, pending_id=pending_id)
 
         missing_note = ""
         if missing_tools:
-            tools_str = ", ".join(missing_tools)
-            missing_note = f"\n\n⚠️ Инструменты не активны (нет API ключей): <code>{tools_str}</code>"
+            missing_note = f"\n\n⚠️ Нет API ключей для: <code>{', '.join(missing_tools)}</code>"
 
         await bot.send_message(
             config.GROUP_CHAT_ID,
             f"✅ <b>Спецификация готова!</b>\n\n"
-            f"<b>Имя:</b> {name}\n"
+            f"<b>Имя:</b> {spec['name']}\n"
             f"<b>Описание:</b> {spec.get('description', '')}\n\n"
             f"<b>Создай бота в @BotFather:</b>\n"
-            f"1. /newbot\n"
-            f"2. Имя: <code>{name}</code>\n"
+            f"1. Отправь /newbot\n"
+            f"2. Имя: <code>{spec['name']}</code>\n"
             f"3. Username: <code>{username}</code>\n"
-            f"4. Скопируй токен и отправь его сюда ответным сообщением."
+            f"4. Добавь @{username} в эту группу\n"
+            f"5. Дай ему права администратора\n"
+            f"6. Скопируй токен и отправь его сюда"
             f"{missing_note}",
             parse_mode="HTML",
         )
