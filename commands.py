@@ -371,13 +371,23 @@ async def _generate_and_show_spec(
                 f'"description": "Краткое описание", "capabilities": "text"}}\n\n'
                 f"Username: латиница, содержит суффикс '_{suffix}_bot'."
             )
-            raw = await agents_module.call_agent(
-                system_prompt="Ты — архитектор AI-агентов. Отвечай только JSON.",
-                user_content=prompt,
-            )
+            spec_system = "Ты — архитектор AI-агентов. Отвечай только JSON."
+            raw = await agents_module.call_agent(system_prompt=spec_system, user_content=prompt)
             spec = extract_json(raw)
             if not spec:
-                raise ValueError("Не удалось разобрать JSON спецификации")
+                # Retry один раз с явным требованием чистого JSON
+                raw = await agents_module.call_agent(
+                    system_prompt=spec_system,
+                    user_content=prompt + "\n\nВажно: ответь строго валидным JSON, без пояснений и markdown.",
+                )
+                spec = extract_json(raw)
+            if not spec:
+                await state.clear()
+                await bot.send_message(
+                    config.GROUP_CHAT_ID,
+                    "❌ Не удалось создать спецификацию, попробуй ещё раз.",
+                )
+                return
             name = spec.get("name", "Новый агент")
             username = spec.get("recommended_username", f"teleflow_agent_{suffix}_bot")
 

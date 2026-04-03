@@ -57,6 +57,12 @@ async def generate_image(prompt: str) -> dict:
         return {"type": "photo", "data": image_bytes}
     except Exception as exc:
         logger.error("generate_image error: %s", exc)
+        err_str = str(exc).lower()
+        if "content_policy" in err_str or "safety" in err_str or "policy_violation" in err_str:
+            return {
+                "type": "text",
+                "data": "❌ Не получилось сгенерировать — описание не прошло проверку безопасности. Попробуй переформулировать запрос.",
+            }
         return {"type": "text", "data": f"❌ Ошибка генерации: {exc}"}
 
 

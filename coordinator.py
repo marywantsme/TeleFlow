@@ -157,12 +157,28 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
                         "Translate the user's image description into a concise DALL-E prompt in English. "
                         "Reply with ONLY the prompt — one line, no explanations, no questions."
                     )
+
+                    # Подгружаем историю предыдущих промптов этого агента для контекста
+                    prev_messages = await database.get_agent_context(slug, limit=6)
+                    prev_prompts = [
+                        m["content"] for m in prev_messages if m["role"] == "assistant"
+                    ][-3:]
+                    if prev_prompts:
+                        numbered = " ".join(f"{i + 1}) {p}" for i, p in enumerate(prev_prompts))
+                        user_content = (
+                            f"Предыдущие запросы: {numbered}\n"
+                            f"Текущий запрос: {task_for_agent}\n"
+                            f"Создай финальный промпт на английском."
+                        )
+                    else:
+                        user_content = task_for_agent
+
                     image_prompt = await typing_while(
                         agent_bot,
                         chat_id,
                         agents_module.call_agent(
                             system_prompt=IMAGE_TRANSLATE_SYSTEM,
-                            user_content=task_for_agent,
+                            user_content=user_content,
                         ),
                     )
                     logger.info("Task #%d: step %s END (got prompt)", task_id, slug)
