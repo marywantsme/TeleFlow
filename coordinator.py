@@ -144,20 +144,25 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
             await database.save_agent_message(task_id, slug, "user", task_for_agent)
 
             has_image_tool = "image_generation" in agent_tool_names and is_available("image_generation")
-            gen_keywords = ["нарисуй", "сгенерируй", "создай изображение", "generate image", "draw", "картинку", "нарисовать"]
 
-            if has_image_tool and any(kw in task.lower() for kw in gen_keywords):
+            # Агент с image_generation ВСЕГДА генерирует картинку — без условий по ключевым словам.
+            # Маршрутизация к нему уже означает что нужна генерация.
+            if has_image_tool:
                 # Агент с image_generation — Claude генерирует промпт, мы отправляем только фото
                 logger.info("Task #%d: step %s START (image_generation)", task_id, slug)
                 try:
-                    # Claude возвращает только промпт для DALL-E — без вопросов и пояснений
+                    # Claude ТОЛЬКО переводит описание в английский промпт для DALL-E.
+                    # Жёсткий системный промпт — никаких вопросов, только одна строка.
+                    IMAGE_TRANSLATE_SYSTEM = (
+                        "Translate the user's image description into a concise DALL-E prompt in English. "
+                        "Reply with ONLY the prompt — one line, no explanations, no questions."
+                    )
                     image_prompt = await typing_while(
                         agent_bot,
                         chat_id,
-                        agents_module.run_agent_by_slug(
-                            slug=slug,
-                            task=task_for_agent,
-                            db_agent=db_agent,
+                        agents_module.call_agent(
+                            system_prompt=IMAGE_TRANSLATE_SYSTEM,
+                            user_content=task_for_agent,
                         ),
                     )
                     logger.info("Task #%d: step %s END (got prompt)", task_id, slug)

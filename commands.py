@@ -273,13 +273,27 @@ async def handle_agent_token(message: Message, state: FSMContext) -> None:
 
         await dynamic_loader.add_bot(slug, token_value, start_polling=False)
 
+        # Генерируем invite link чтобы помочь добавить бота в группу
+        try:
+            invite = await bot.create_chat_invite_link(config.GROUP_CHAT_ID)
+            invite_note = (
+                f"\n\n🔗 Если бот ещё не в группе — <a href='{invite.invite_link}'>перейди по ссылке</a> "
+                f"или добавь @{me.username} вручную."
+            )
+        except Exception:
+            invite_note = f"\n\nЕсли бот ещё не в группе — добавь @{me.username} вручную и дай права администратора."
+
         new_bot = dynamic_loader.get_bot(slug)
         if new_bot:
-            await new_bot.send_message(
-                config.GROUP_CHAT_ID,
-                f"👋 Привет! Я — <b>{spec.get('name', slug)}</b>. Готов к работе!",
-                parse_mode="HTML",
-            )
+            try:
+                await new_bot.send_message(
+                    config.GROUP_CHAT_ID,
+                    f"👋 Привет! Я — <b>{spec.get('name', slug)}</b>. Готов к работе!",
+                    parse_mode="HTML",
+                )
+                invite_note = ""  # Бот уже в группе, ссылка не нужна
+            except Exception:
+                pass  # Бот не в группе — invite_note останется
 
         # Удаляем использованное предложение из pending_agents
         pending_id = data.get("pending_id", 0)
@@ -288,8 +302,9 @@ async def handle_agent_token(message: Message, state: FSMContext) -> None:
 
         await bot.send_message(
             config.GROUP_CHAT_ID,
-            f"✅ Агент <code>{slug}</code> (@{me.username}) подключён!",
+            f"✅ Агент <code>{slug}</code> (@{me.username}) подключён!{invite_note}",
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
         await state.clear()
 
@@ -418,11 +433,12 @@ async def _generate_and_show_spec(
             f"1. Отправь /newbot\n"
             f"2. Имя: <code>{spec['name']}</code>\n"
             f"3. Username: <code>{username}</code>\n"
-            f"4. Добавь @{username} в эту группу\n"
+            f"4. <a href='https://t.me/{username}?startgroup=true'>Нажми сюда</a> чтобы добавить @{username} в группу\n"
             f"5. Дай ему права администратора\n"
             f"6. Скопируй токен и отправь его сюда"
             f"{missing_note}",
             parse_mode="HTML",
+            disable_web_page_preview=True,
         )
     except Exception as exc:
         logger.error("Agent spec generation failed: %s", exc)
