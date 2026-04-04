@@ -10,10 +10,39 @@ import database
 import dynamic_loader
 import agents as agents_module
 import media
-from tools import run_tool, is_available
+from tools import run_tool, is_available, is_available_async
 from utils import typing_while
 
 logger = logging.getLogger(__name__)
+
+
+async def _dispatch_image(prompt: str) -> tuple[str, bytes | str | None]:
+    """
+    Выбирает лучший доступный провайдер для генерации изображения.
+    Приоритет: OpenRouter > Stability > DALL-E (DB) > DALL-E (env).
+    Возвращает (type, data) где type = 'photo' или 'text'.
+    """
+    from plugin_handlers import handle_openrouter_image, handle_stability, handle_dalle
+
+    openrouter_key = await database.get_plugin_key("openrouter")
+    if openrouter_key:
+        result = await handle_openrouter_image(prompt, openrouter_key)
+        return result.type, result.data
+
+    stability_key = await database.get_plugin_key("stability")
+    if stability_key:
+        result = await handle_stability(prompt, stability_key)
+        return result.type, result.data
+
+    dalle_key = await database.get_plugin_key("dalle")
+    if dalle_key:
+        result = await handle_dalle(prompt, dalle_key)
+        return result.type, result.data
+
+    # Fallback: env-переменная (tools.py)
+    img_result = await run_tool("image_generation", prompt=prompt)
+    return img_result.get("type", "text"), img_result.get("data")
+
 
 # Эмодзи для агентов по slug
 AGENT_EMOJI = {
@@ -136,14 +165,18 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
             agent_tool_names = [t["name"] for t in agent_tool_list]
 
             web_results = None
-            if "web_search" in agent_tool_names and is_available("web_search"):
+            if "web_search" in agent_tool_names and await is_available_async("web_search"):
                 result_dict = await run_tool("web_search", query=task_for_agent)
                 web_results = result_dict.get("data")
 
             # Сохраняем пользовательский запрос как входящий контекст агента
             await database.save_agent_message(task_id, slug, "user", task_for_agent)
 
-            has_image_tool = "image_generation" in agent_tool_names and is_available("image_generation")
+            has_image_tool = "image_generation" in agent_tool_names and await is_available_async("image_generation")
+
+            # Определяем TTS-возможности агента
+            agent_caps = (db_agent.get("capabilities", "") if db_agent else "").split(",")
+            has_tts = any(c.strip() in ("text_to_audio", "tts") for c in agent_caps)
 
             # Агент с image_generation ВСЕГДА генерирует картинку — без условий по ключевым словам.
             # Маршрутизация к нему уже означает что нужна генерация.
@@ -151,10 +184,10 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
                 # Агент с image_generation — Claude генерирует промпт, мы отправляем только фото
                 logger.info("Task #%d: step %s START (image_generation)", task_id, slug)
                 try:
-                    # Claude ТОЛЬКО переводит описание в английский промпт для DALL-E.
+                    # Claude ТОЛЬКО переводит описание в английский промпт.
                     # Жёсткий системный промпт — никаких вопросов, только одна строка.
                     IMAGE_TRANSLATE_SYSTEM = (
-                        "Translate the user's image description into a concise DALL-E prompt in English. "
+                        "Translate the user's image description into a concise image generation prompt in English. "
                         "Reply with ONLY the prompt — one line, no explanations, no questions."
                     )
 
@@ -182,16 +215,18 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
                         ),
                     )
                     logger.info("Task #%d: step %s END (got prompt)", task_id, slug)
-                    await agent_bot.send_message(chat_id, "🎨 Генерирую изображение...")
-                    img_result = await run_tool("image_generation", prompt=image_prompt)
-                    if img_result.get("type") == "photo" and img_result.get("data"):
-                        photo = BufferedInputFile(file=img_result["data"], filename="generated.png")
+                    await agent_bot.send_message(chat_id, "🎨 Генерирую...")
+
+                    # Выбираем провайдера: OpenRouter > Stability > DALL-E (env/DB)
+                    img_type, img_data = await _dispatch_image(image_prompt)
+
+                    if img_type == "photo" and img_data:
+                        photo = BufferedInputFile(file=img_data, filename="generated.png")
                         await agent_bot.send_photo(chat_id, photo=photo)
                         await database.save_agent_message(task_id, slug, "assistant", image_prompt)
                         task_for_agent = image_prompt
                     else:
-                        # Инструмент вернул ошибку — отправляем текст
-                        err = img_result.get("data", "Ошибка генерации")
+                        err = img_data or "Ошибка генерации"
                         await agent_bot.send_message(chat_id, str(err))
                 except Exception as exc:
                     logger.error("Task #%d: agent '%s' image error: %s", task_id, slug, exc)
@@ -227,6 +262,26 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
                 except Exception:
                     await agent_bot.send_message(chat_id, f"{emoji} {result}")
                 task_for_agent = result
+
+                # TTS: если агент умеет text_to_audio и есть ключ ElevenLabs
+                if has_tts:
+                    tts_key = await database.get_plugin_key("elevenlabs_tts")
+                    if not tts_key:
+                        tts_key = await database.get_plugin_key("elevenlabs_voice")
+                    if tts_key:
+                        try:
+                            await agent_bot.send_message(chat_id, "🎤 Озвучиваю...")
+                            from plugin_handlers import handle_elevenlabs_tts
+                            tts_result = await handle_elevenlabs_tts(result, tts_key)
+                            if tts_result.type == "voice" and tts_result.data:
+                                voice_file = BufferedInputFile(
+                                    file=tts_result.data, filename="speech.mp3"
+                                )
+                                await agent_bot.send_voice(chat_id, voice=voice_file)
+                            else:
+                                logger.warning("TTS failed for agent '%s': %s", slug, tts_result.data)
+                        except Exception as exc:
+                            logger.error("TTS error for agent '%s': %s", slug, exc)
 
             await asyncio.sleep(1.5)
 

@@ -13,13 +13,23 @@ logger = logging.getLogger(__name__)
 
 
 async def web_search(query: str) -> dict:
-    """Ищет актуальную информацию через Tavily."""
-    if not TAVILY_API_KEY:
+    """Ищет актуальную информацию через Tavily (env или plugin_keys)."""
+    # Проверяем plugin_keys сначала, потом env
+    api_key = TAVILY_API_KEY
+    try:
+        from database import get_plugin_key
+        plugin_key = await get_plugin_key("tavily")
+        if plugin_key:
+            api_key = plugin_key
+    except Exception:
+        pass
+
+    if not api_key:
         return {"type": "text", "data": None}
     try:
         from tavily import TavilyClient
         import asyncio
-        client = TavilyClient(api_key=TAVILY_API_KEY)
+        client = TavilyClient(api_key=api_key)
         results = await asyncio.get_event_loop().run_in_executor(
             None, lambda: client.search(query, max_results=5)
         )
@@ -67,16 +77,25 @@ async def generate_image(prompt: str) -> dict:
 
 
 async def transcribe_voice(file_bytes: bytes, file_id: str) -> dict:
-    """Транскрибирует голосовое сообщение через Whisper."""
-    if not OPENAI_API_KEY:
+    """Транскрибирует голосовое сообщение через Whisper (env или plugin_keys)."""
+    # Проверяем plugin_keys сначала
+    api_key = OPENAI_API_KEY
+    try:
+        from database import get_plugin_key
+        plugin_key = await get_plugin_key("whisper")
+        if plugin_key:
+            api_key = plugin_key
+    except Exception:
+        pass
+
+    if not api_key:
         return {"type": "text", "data": None}
     tmp_path = f"/tmp/voice_{file_id}.ogg"
     try:
         from openai import AsyncOpenAI
-        import io
         with open(tmp_path, "wb") as f:
             f.write(file_bytes)
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        client = AsyncOpenAI(api_key=api_key)
         with open(tmp_path, "rb") as f:
             transcript = await client.audio.transcriptions.create(
                 model="whisper-1", file=f, language="ru"
@@ -115,12 +134,34 @@ TOOLS = {
 
 
 def is_available(tool_name: str) -> bool:
-    """Проверяет доступен ли инструмент (задан ли нужный env ключ)."""
+    """Проверяет доступен ли инструмент (по env-переменной)."""
     tool = TOOLS.get(tool_name)
     if not tool:
         return False
     env_key = tool.get("env_key", "")
     return bool(os.getenv(env_key, ""))
+
+
+# Маппинг tool_name → plugin_names которые его покрывают
+_TOOL_PLUGIN_MAP = {
+    "web_search": ["tavily"],
+    "image_generation": ["openrouter", "dalle", "stability"],
+    "voice_transcription": ["whisper", "openrouter"],
+}
+
+
+async def is_available_async(tool_name: str) -> bool:
+    """Проверяет доступность инструмента: env-переменные И plugin_keys в БД."""
+    if is_available(tool_name):
+        return True
+    try:
+        from database import get_plugin_key
+        for plugin_name in _TOOL_PLUGIN_MAP.get(tool_name, []):
+            if await get_plugin_key(plugin_name):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 async def run_tool(tool_name: str, **kwargs) -> dict:

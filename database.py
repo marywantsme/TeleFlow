@@ -1,10 +1,35 @@
 import aiosqlite
+import base64
 import logging
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 DB_PATH = "teleflow.db"
+
+# ──────────────────────────────────────────────
+# Базовое обфускирование API-ключей
+# ──────────────────────────────────────────────
+
+_OBF_KEY = b"TeleFlow_v3_2024_plugins"
+
+
+def _obfuscate(text: str) -> str:
+    data = text.encode("utf-8")
+    key = _OBF_KEY
+    xored = bytes(data[i] ^ key[i % len(key)] for i in range(len(data)))
+    return base64.b64encode(xored).decode("ascii")
+
+
+def _deobfuscate(encoded: str) -> str:
+    try:
+        xored = base64.b64decode(encoded)
+        key = _OBF_KEY
+        data = bytes(xored[i] ^ key[i % len(key)] for i in range(len(xored)))
+        return data.decode("utf-8")
+    except Exception:
+        # Если декодирование не удалось — возвращаем как есть (старый незашифрованный ключ)
+        return encoded
 
 
 async def init_db() -> None:
@@ -69,6 +94,23 @@ async def init_db() -> None:
                 capabilities TEXT DEFAULT 'text',
                 original_task TEXT DEFAULT '',
                 suggested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS plugin_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plugin_name TEXT UNIQUE NOT NULL,
+                api_key_encrypted TEXT NOT NULL,
+                added_by_user_id INTEGER DEFAULT 0,
+                is_active INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_plugins (
+                agent_id INTEGER NOT NULL,
+                plugin_name TEXT NOT NULL,
+                PRIMARY KEY (agent_id, plugin_name)
             )
         """)
         await db.commit()
@@ -324,3 +366,85 @@ async def delete_pending_agent(pending_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM pending_agents WHERE id = ?", (pending_id,))
         await db.commit()
+
+
+# ──────────────────────────────────────────────
+# plugin_keys — хранение API-ключей плагинов
+# ──────────────────────────────────────────────
+
+async def save_plugin_key(plugin_name: str, api_key: str, user_id: int = 0) -> None:
+    """Сохраняет или обновляет API-ключ плагина (с обфускированием)."""
+    encrypted = _obfuscate(api_key)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO plugin_keys (plugin_name, api_key_encrypted, added_by_user_id, is_active)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(plugin_name) DO UPDATE SET
+                   api_key_encrypted = excluded.api_key_encrypted,
+                   added_by_user_id = excluded.added_by_user_id,
+                   is_active = 1,
+                   created_at = CURRENT_TIMESTAMP""",
+            (plugin_name, encrypted, user_id),
+        )
+        await db.commit()
+    logger.info("Plugin key saved: %s (user %d)", plugin_name, user_id)
+
+
+async def get_plugin_key(plugin_name: str) -> Optional[str]:
+    """Возвращает расшифрованный API-ключ плагина или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT api_key_encrypted FROM plugin_keys WHERE plugin_name = ? AND is_active = 1",
+            (plugin_name,),
+        )
+        row = await cursor.fetchone()
+    if row:
+        return _deobfuscate(row[0])
+    return None
+
+
+async def get_active_plugin_names() -> list[str]:
+    """Возвращает список имён подключённых плагинов."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT plugin_name FROM plugin_keys WHERE is_active = 1 ORDER BY created_at ASC"
+        )
+        rows = await cursor.fetchall()
+    return [r["plugin_name"] for r in rows]
+
+
+async def delete_plugin_key(plugin_name: str) -> None:
+    """Деактивирует плагин (ключ не удаляется, помечается неактивным)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE plugin_keys SET is_active = 0 WHERE plugin_name = ?",
+            (plugin_name,),
+        )
+        await db.commit()
+    logger.info("Plugin key deactivated: %s", plugin_name)
+
+
+# ──────────────────────────────────────────────
+# agent_plugins — привязка плагинов к агентам
+# ──────────────────────────────────────────────
+
+async def assign_plugin_to_agent(agent_id: int, plugin_name: str) -> None:
+    """Привязывает плагин к агенту."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO agent_plugins (agent_id, plugin_name) VALUES (?, ?)",
+            (agent_id, plugin_name),
+        )
+        await db.commit()
+
+
+async def get_agent_plugin_names(agent_id: int) -> list[str]:
+    """Возвращает список плагинов привязанных к агенту."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT plugin_name FROM agent_plugins WHERE agent_id = ?",
+            (agent_id,),
+        )
+        rows = await cursor.fetchall()
+    return [r[0] for r in rows]
