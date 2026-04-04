@@ -7,7 +7,12 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.enums import ContentType
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 import config
 import database
@@ -523,18 +528,40 @@ def _mask_key(key: str) -> str:
     return f"{key[:3]}...{key[-4:]}"
 
 
-@router.message(F.chat.id == config.GROUP_CHAT_ID, Command("plugins"))
-async def cmd_plugins(message: Message) -> None:
-    bot = _manager()
-    if not bot:
-        return
+def _parse_plugin_arg(text: str) -> str | None:
+    """Извлекает имя плагина из текста команды, игнорируя @username.
+    Например: '/connect@teleflow_manager_bot openrouter' → 'openrouter'
+              '/connect openrouter' → 'openrouter'
+    """
+    parts = text.split()
+    # Фильтруем части начинающиеся с '/' или '@' (сама команда)
+    args = [p for p in parts[1:] if not p.startswith("@")]
+    return args[0].lower() if args else None
 
+
+async def _send_connect_info(bot, plugin_name: str) -> None:
+    """Отправляет инструкцию по подключению плагина."""
+    from plugins_registry import PLUGINS
+    info = PLUGINS[plugin_name]
+    text = (
+        f"🔌 <b>{info['display_name']}</b>\n\n"
+        f"{info['description']}\n\n"
+        f"<b>Инструкция:</b>\n{info['setup_instructions']}\n\n"
+        f"💰 {info['cost_info']}\n\n"
+        f"Когда получишь ключ, отправь:\n"
+        f"<code>/apikey {plugin_name} [твой_ключ]</code>\n\n"
+        f"<i>Сообщение с ключом будет автоматически удалено.</i>"
+    )
+    await bot.send_message(config.GROUP_CHAT_ID, text, parse_mode="HTML")
+
+
+async def _build_plugins_message() -> tuple[str, InlineKeyboardMarkup | None]:
+    """Строит текст и клавиатуру для /plugins."""
     from plugins_registry import PLUGINS
     import config as _cfg
 
     active_names = await database.get_active_plugin_names()
 
-    # Дополнительно показываем плагины активные через env-переменные
     env_active = set()
     env_map = {
         "dalle": _cfg.OPENAI_API_KEY,
@@ -548,28 +575,103 @@ async def cmd_plugins(message: Message) -> None:
     connected = set(active_names) | env_active
 
     connected_lines = []
-    available_lines = []
+    connect_buttons: list[InlineKeyboardButton] = []
+    disconnect_buttons: list[InlineKeyboardButton] = []
 
     for name, info in PLUGINS.items():
         display = info["display_name"]
         if name in connected:
-            connected_lines.append(f"• {display}")
+            connected_lines.append(f"• {display} ✅")
+            disconnect_buttons.append(
+                InlineKeyboardButton(
+                    text=f"❌ {display}",
+                    callback_data=f"disconnect_{name}",
+                )
+            )
         else:
-            available_lines.append(f"• {display} — /connect {name}")
+            connect_buttons.append(
+                InlineKeyboardButton(
+                    text=f"🔌 {display}",
+                    callback_data=f"connect_{name}",
+                )
+            )
 
     text = "🔌 <b>Плагины TeleFlow:</b>\n"
-
     if connected_lines:
-        text += "\n✅ <b>Подключены:</b>\n" + "\n".join(connected_lines)
+        text += "\n" + "\n".join(connected_lines)
     else:
-        text += "\n✅ Нет подключённых плагинов."
+        text += "\nНет подключённых плагинов."
 
-    if available_lines:
-        text += "\n\n⬜ <b>Доступны для подключения:</b>\n" + "\n".join(available_lines)
+    if connect_buttons:
+        text += "\n\n<b>Подключить:</b>"
 
-    text += "\n\n💡 OpenRouter даёт доступ к картинкам, тексту и аудио одним ключом: /connect openrouter"
+    # Кнопки по одной в строке
+    rows = [[btn] for btn in connect_buttons]
+    if disconnect_buttons:
+        rows += [[btn] for btn in disconnect_buttons]
 
-    await bot.send_message(config.GROUP_CHAT_ID, text, parse_mode="HTML")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    return text, keyboard
+
+
+@router.message(F.chat.id == config.GROUP_CHAT_ID, Command("plugins"))
+async def cmd_plugins(message: Message) -> None:
+    bot = _manager()
+    if not bot:
+        return
+    text, keyboard = await _build_plugins_message()
+    await bot.send_message(
+        config.GROUP_CHAT_ID, text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("connect_"))
+async def cb_connect(callback: CallbackQuery) -> None:
+    await callback.answer()
+    bot = _manager()
+    if not bot:
+        return
+    from plugins_registry import PLUGINS
+    plugin_name = callback.data.removeprefix("connect_")
+    if plugin_name not in PLUGINS:
+        return
+    await _send_connect_info(bot, plugin_name)
+
+
+@router.callback_query(F.data.startswith("disconnect_"))
+async def cb_disconnect(callback: CallbackQuery) -> None:
+    await callback.answer()
+    bot = _manager()
+    if not bot:
+        return
+    from plugins_registry import PLUGINS
+    plugin_name = callback.data.removeprefix("disconnect_")
+    if plugin_name not in PLUGINS:
+        return
+
+    active = await database.get_active_plugin_names()
+    if plugin_name not in active:
+        await bot.send_message(
+            config.GROUP_CHAT_ID,
+            f"⚠️ Плагин уже не подключён.",
+        )
+        return
+
+    await database.delete_plugin_key(plugin_name)
+    info = PLUGINS[plugin_name]
+    await bot.send_message(
+        config.GROUP_CHAT_ID,
+        f"✅ <b>{info['display_name']}</b> отключён.",
+        parse_mode="HTML",
+    )
+    # Обновляем сообщение с кнопками
+    text, keyboard = await _build_plugins_message()
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        pass
 
 
 @router.message(F.chat.id == config.GROUP_CHAT_ID, Command("connect"))
@@ -580,16 +682,17 @@ async def cmd_connect(message: Message) -> None:
 
     from plugins_registry import PLUGINS
 
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        names = "\n".join(f"• /connect {n}" for n in PLUGINS)
+    plugin_name = _parse_plugin_arg(message.text or "")
+    if not plugin_name:
+        # Показываем /plugins с кнопками
+        text, keyboard = await _build_plugins_message()
         await bot.send_message(
-            config.GROUP_CHAT_ID,
-            f"❌ Укажи плагин. Доступные:\n{names}",
+            config.GROUP_CHAT_ID, text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
         )
         return
 
-    plugin_name = parts[1].strip().lower()
     if plugin_name not in PLUGINS:
         await bot.send_message(
             config.GROUP_CHAT_ID,
@@ -598,17 +701,7 @@ async def cmd_connect(message: Message) -> None:
         )
         return
 
-    info = PLUGINS[plugin_name]
-    text = (
-        f"🔌 <b>{info['display_name']}</b>\n\n"
-        f"{info['description']}\n\n"
-        f"<b>Инструкция:</b>\n{info['setup_instructions']}\n\n"
-        f"💰 {info['cost_info']}\n\n"
-        f"Когда получишь ключ, отправь:\n"
-        f"<code>/apikey {plugin_name} [твой_ключ]</code>\n\n"
-        f"<i>Сообщение с ключом будет автоматически удалено.</i>"
-    )
-    await bot.send_message(config.GROUP_CHAT_ID, text, parse_mode="HTML")
+    await _send_connect_info(bot, plugin_name)
 
 
 @router.message(F.chat.id == config.GROUP_CHAT_ID, Command("apikey"))
@@ -625,8 +718,10 @@ async def cmd_apikey(message: Message) -> None:
 
     from plugins_registry import PLUGINS, SHARED_KEY_GROUPS
 
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 3:
+    # Разбираем вручную чтобы отфильтровать @username часть
+    raw_parts = (message.text or "").split()
+    args = [p for p in raw_parts[1:] if not p.startswith("@")]
+    if len(args) < 2:
         await bot.send_message(
             config.GROUP_CHAT_ID,
             "❌ Синтаксис: /apikey [plugin_name] [key]\n"
@@ -634,8 +729,8 @@ async def cmd_apikey(message: Message) -> None:
         )
         return
 
-    plugin_name = parts[1].strip().lower()
-    api_key = parts[2].strip()
+    plugin_name = args[0].lower()
+    api_key = " ".join(args[1:])
 
     if plugin_name not in PLUGINS:
         await bot.send_message(
@@ -678,15 +773,13 @@ async def cmd_disconnect(message: Message) -> None:
 
     from plugins_registry import PLUGINS
 
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
+    plugin_name = _parse_plugin_arg(message.text or "")
+    if not plugin_name:
         await bot.send_message(
             config.GROUP_CHAT_ID,
             "❌ Синтаксис: /disconnect [plugin_name]",
         )
         return
-
-    plugin_name = parts[1].strip().lower()
     if plugin_name not in PLUGINS:
         await bot.send_message(
             config.GROUP_CHAT_ID,
