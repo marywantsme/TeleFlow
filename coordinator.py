@@ -259,8 +259,38 @@ async def run_pipeline(message: Message, task: str, image_b64: str = None) -> No
                 emoji = AGENT_EMOJI.get(slug, "🤖")
                 try:
                     await agent_bot.send_message(chat_id, f"{emoji} {result}", parse_mode="HTML")
-                except Exception:
-                    await agent_bot.send_message(chat_id, f"{emoji} {result}")
+                except Exception as send_exc:
+                    # "chat not found" = бота нет в группе. Деактивируем и подсказываем решение.
+                    if "chat not found" in str(send_exc).lower():
+                        try:
+                            await database.deactivate_agent(slug)
+                            await dynamic_loader.remove_bot(slug)
+                        except Exception:
+                            pass
+                        username = (db_agent or {}).get("username") or slug
+                        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+                        kb = InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(
+                                text=f"➕ Добавить @{username} в группу",
+                                url=f"https://t.me/{username}?startgroup=true",
+                            )
+                        ]])
+                        await manager_bot.send_message(
+                            chat_id,
+                            (
+                                f"⚠️ Бот <b>{(db_agent or {}).get('name', slug)}</b> (@{username}) "
+                                "не в этой группе — выключил его до добавления. "
+                                "Нажми кнопку и выбери этот чат."
+                            ),
+                            parse_mode="HTML",
+                            reply_markup=kb,
+                        )
+                        await database.update_task_status(task_id, "error")
+                        return
+                    try:
+                        await agent_bot.send_message(chat_id, f"{emoji} {result}")
+                    except Exception:
+                        raise send_exc
                 task_for_agent = result
 
                 # TTS: если агент умеет text_to_audio и есть ключ ElevenLabs
