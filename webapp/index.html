@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>TeleFlow</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: var(--tg-theme-bg-color, #0f1012);
+      --bg-elev: var(--tg-theme-secondary-bg-color, #17191d);
+      --text: var(--tg-theme-text-color, #f2f3f5);
+      --muted: var(--tg-theme-hint-color, #8a8f98);
+      --accent: var(--tg-theme-button-color, #4a8cff);
+      --accent-text: var(--tg-theme-button-text-color, #ffffff);
+      --border: rgba(255,255,255,0.06);
+      --danger: #ff5c5c;
+      --ok: #39d39f;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--text);
+      -webkit-font-smoothing: antialiased;
+      font-size: 15px;
+    }
+    body { padding-bottom: 72px; }
+    header {
+      padding: 20px 16px 8px; display: flex; align-items: baseline; justify-content: space-between;
+    }
+    header h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+    header .badge {
+      font-size: 11px; color: var(--muted); padding: 3px 8px; border-radius: 6px;
+      background: var(--bg-elev);
+    }
+    .screen { padding: 8px 16px 16px; display: none; }
+    .screen.active { display: block; }
+    .card {
+      background: var(--bg-elev); border-radius: 14px; padding: 14px 16px;
+      margin-bottom: 10px; border: 1px solid var(--border);
+    }
+    .card h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+    .card p { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.4; }
+    .row { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+    .pill {
+      font-size: 11px; padding: 3px 8px; border-radius: 999px;
+      background: rgba(255,255,255,0.05); color: var(--muted);
+    }
+    .pill.ok { color: var(--ok); background: rgba(57,211,159,0.12); }
+    .pill.off { color: var(--muted); }
+    .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 6px; }
+    .stat {
+      background: var(--bg-elev); border-radius: 12px; padding: 14px 12px; text-align: center;
+      border: 1px solid var(--border);
+    }
+    .stat .num { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+    .stat .lbl { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.05em; }
+    nav.tabs {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      display: grid; grid-template-columns: repeat(5, 1fr);
+      background: var(--bg-elev); border-top: 1px solid var(--border);
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    nav.tabs button {
+      appearance: none; background: none; border: 0; color: var(--muted);
+      padding: 10px 0 12px; font-size: 11px; font-family: inherit;
+      display: flex; flex-direction: column; align-items: center; gap: 3px;
+      cursor: pointer;
+    }
+    nav.tabs button.active { color: var(--accent); }
+    nav.tabs button .ic { font-size: 18px; line-height: 1; }
+    .empty { color: var(--muted); text-align: center; padding: 40px 0; font-size: 13px; }
+    .history-item .status {
+      display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+      background: var(--muted); margin-right: 6px; vertical-align: middle;
+    }
+    .history-item .status.done { background: var(--ok); }
+    .history-item .status.error { background: var(--danger); }
+    .history-item .status.pending { background: #f3c04a; }
+    .muted { color: var(--muted); }
+    .tiny { font-size: 12px; }
+    a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>TeleFlow</h1>
+    <span class="badge" id="version">v3.1</span>
+  </header>
+
+  <!-- Dashboard -->
+  <section class="screen active" data-screen="dashboard">
+    <div class="stats-grid">
+      <div class="stat"><div class="num" id="stat-agents">—</div><div class="lbl">Агенты</div></div>
+      <div class="stat"><div class="num" id="stat-plugins">—</div><div class="lbl">Плагины</div></div>
+      <div class="stat"><div class="num" id="stat-tasks">—</div><div class="lbl">Задачи</div></div>
+    </div>
+    <div class="card" style="margin-top: 16px;">
+      <h3>Добро пожаловать</h3>
+      <p>TeleFlow — мультиагентная AI-платформа в Telegram. Управляй агентами, плагинами и историей задач из этой панели.</p>
+    </div>
+  </section>
+
+  <!-- Agents -->
+  <section class="screen" data-screen="agents">
+    <div id="agents-list"></div>
+  </section>
+
+  <!-- Plugins -->
+  <section class="screen" data-screen="plugins">
+    <div id="plugins-list"></div>
+  </section>
+
+  <!-- History -->
+  <section class="screen" data-screen="history">
+    <div id="history-list"></div>
+  </section>
+
+  <!-- Settings -->
+  <section class="screen" data-screen="settings">
+    <div class="card">
+      <h3>Пользователь</h3>
+      <p id="user-info" class="tiny">—</p>
+    </div>
+    <div class="card">
+      <h3>О TeleFlow</h3>
+      <p>Python/aiogram 3 + Claude API. Open source на GitHub: <a href="https://github.com/marywantsme/teleflow" target="_blank">marywantsme/teleflow</a>.</p>
+    </div>
+  </section>
+
+  <nav class="tabs">
+    <button data-tab="dashboard" class="active"><span class="ic">📊</span>Панель</button>
+    <button data-tab="agents"><span class="ic">🤖</span>Агенты</button>
+    <button data-tab="plugins"><span class="ic">🔌</span>Плагины</button>
+    <button data-tab="history"><span class="ic">📋</span>История</button>
+    <button data-tab="settings"><span class="ic">⚙️</span>Настройки</button>
+  </nav>
+
+  <script>
+    const tg = window.Telegram?.WebApp;
+    if (tg) { tg.ready(); tg.expand(); }
+
+    const user = tg?.initDataUnsafe?.user;
+    const userId = user?.id || 0;
+    document.getElementById('user-info').textContent = user
+      ? `${user.first_name || ''} ${user.last_name || ''} (@${user.username || 'no_username'}, id=${user.id})`
+      : 'Открой из Telegram-клиента, чтобы увидеть данные пользователя.';
+
+    async function jget(url) {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }
+
+    async function loadStats() {
+      try {
+        const s = await jget('/api/stats');
+        document.getElementById('stat-agents').textContent = s.agents_active;
+        document.getElementById('stat-plugins').textContent = s.plugins_connected;
+        document.getElementById('stat-tasks').textContent = s.tasks_total;
+      } catch (e) { /* offline */ }
+    }
+
+    async function loadAgents() {
+      const list = document.getElementById('agents-list');
+      list.innerHTML = '<div class="empty">Загрузка...</div>';
+      try {
+        const items = await jget('/api/agents');
+        if (!items.length) { list.innerHTML = '<div class="empty">Агентов пока нет.</div>'; return; }
+        list.innerHTML = items.map(a => `
+          <div class="card">
+            <div class="row"><h3>${escape(a.name)}</h3><span class="pill">${escape(a.capabilities)}</span></div>
+            <p>${escape(a.description || '—')}</p>
+            <p class="tiny muted" style="margin-top:6px;">@${escape(a.username || a.slug)}</p>
+          </div>`).join('');
+      } catch (e) {
+        list.innerHTML = '<div class="empty">Не удалось загрузить агентов.</div>';
+      }
+    }
+
+    async function loadPlugins() {
+      const list = document.getElementById('plugins-list');
+      list.innerHTML = '<div class="empty">Загрузка...</div>';
+      try {
+        const items = await jget('/api/plugins');
+        list.innerHTML = items.map(p => `
+          <div class="card">
+            <div class="row">
+              <h3>${escape(p.display_name)}</h3>
+              <span class="pill ${p.connected ? 'ok' : 'off'}">${p.connected ? 'подключён' : 'не подключён'}</span>
+            </div>
+            <p>${escape(p.description)}</p>
+            <p class="tiny muted" style="margin-top:6px;">${escape(p.cost_info)}</p>
+          </div>`).join('');
+      } catch (e) {
+        list.innerHTML = '<div class="empty">Не удалось загрузить плагины.</div>';
+      }
+    }
+
+    async function loadHistory() {
+      const list = document.getElementById('history-list');
+      list.innerHTML = '<div class="empty">Загрузка...</div>';
+      try {
+        const items = await jget('/api/history?user_id=' + userId);
+        if (!items.length) { list.innerHTML = '<div class="empty">История пуста.</div>'; return; }
+        list.innerHTML = items.map(t => `
+          <div class="card history-item">
+            <p><span class="status ${t.status}"></span><b>#${t.id}</b> · ${escape(t.text.slice(0, 120))}</p>
+            <p class="tiny muted" style="margin-top:4px;">${escape(t.created_at)}</p>
+          </div>`).join('');
+      } catch (e) {
+        list.innerHTML = '<div class="empty">Не удалось загрузить историю.</div>';
+      }
+    }
+
+    function escape(s) {
+      return String(s ?? '').replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+    }
+
+    document.querySelectorAll('nav.tabs button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const tab = btn.dataset.tab;
+        document.querySelectorAll('nav.tabs button').forEach(b => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.screen').forEach(s => s.classList.toggle('active', s.dataset.screen === tab));
+        if (tab === 'agents') loadAgents();
+        else if (tab === 'plugins') loadPlugins();
+        else if (tab === 'history') loadHistory();
+        else if (tab === 'dashboard') loadStats();
+      });
+    });
+
+    loadStats();
+  </script>
+</body>
+</html>

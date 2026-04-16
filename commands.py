@@ -18,6 +18,7 @@ import config
 import database
 import dynamic_loader
 import agents as agents_module
+import managed_bots
 from utils import random_suffix, extract_json
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,91 @@ class AddAgentStates(StatesGroup):
 
 def setup(dp: Dispatcher) -> None:
     dp.include_router(router)
+    dp.update.outer_middleware(_managed_bot_middleware)
+
+
+async def _managed_bot_middleware(handler, event, data):
+    """Перехватывает updates с полем managed_bot (Bot API 9.6)."""
+    try:
+        extra = getattr(event, "model_extra", None) or {}
+        mb = extra.get("managed_bot")
+        if mb:
+            await _handle_managed_bot_update(mb)
+            return
+    except Exception as exc:
+        logger.exception("managed_bot middleware error: %s", exc)
+    return await handler(event, data)
+
+
+async def _handle_managed_bot_update(mb_update: dict) -> None:
+    """
+    Обрабатывает managed_bot update: получает токен, активирует агента,
+    запускает его polling и отправляет уведомление в группу.
+    """
+    bot = _manager()
+    if not bot:
+        return
+
+    bot_info = mb_update.get("bot") or {}
+    bot_user_id = bot_info.get("id")
+    bot_username = (bot_info.get("username") or "").lstrip("@")
+    bot_name = bot_info.get("first_name") or ""
+
+    if not bot_user_id:
+        logger.error("managed_bot update without bot.id: %s", mb_update)
+        return
+
+    try:
+        token = await managed_bots.get_managed_bot_token(config.MANAGER_TOKEN, bot_user_id)
+    except Exception as exc:
+        logger.error("getManagedBotToken failed for %s: %s", bot_user_id, exc)
+        await bot.send_message(
+            config.GROUP_CHAT_ID,
+            f"❌ Получил managed-бота @{bot_username}, но не смог запросить токен: {exc}",
+        )
+        return
+
+    # Ищем черновик агента в реестре (был создан с пустым токеном на этапе spec)
+    agent_row = await database.get_agent_by_username(bot_username)
+    if not agent_row:
+        # Черновика нет — создаём заново на лету
+        slug = bot_username.replace("_bot", "").replace("teleflow_", "").strip("_").lower()
+        if not slug:
+            slug = f"agent_{bot_user_id}"
+        await database.upsert_agent(
+            slug=slug,
+            name=bot_name or slug.capitalize(),
+            token=token,
+            system_prompt=f"Ты — {bot_name or slug}. Отвечай по теме.",
+            description="Managed bot",
+            capabilities="text",
+            username=bot_username,
+        )
+    else:
+        slug = agent_row["slug"]
+        await database.update_agent_token(slug, token)
+
+    try:
+        await dynamic_loader.add_bot(slug, token, start_polling=False)
+    except Exception as exc:
+        logger.error("add_bot failed for %s: %s", slug, exc)
+
+    new_bot = dynamic_loader.get_bot(slug)
+    if new_bot:
+        try:
+            await new_bot.send_message(
+                config.GROUP_CHAT_ID,
+                f"👋 Привет! Я — <b>{bot_name or slug}</b>. Готов к работе!",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    await bot.send_message(
+        config.GROUP_CHAT_ID,
+        f"✅ Managed-бот <b>{bot_name or slug}</b> (@{bot_username}) создан и подключён!",
+        parse_mode="HTML",
+    )
 
 
 def _manager():
@@ -51,19 +137,20 @@ async def cmd_start(message: Message) -> None:
     if not bot:
         return
     text = (
-        "👋 <b>TeleFlow v3.0</b>\n\n"
+        "👋 <b>TeleFlow v3.1</b>\n\n"
         "Пишите задачу — распределю по агентам.\n\n"
         "<b>Агенты:</b>\n"
         "• /status — статус и агенты\n"
         "• /agents — список агентов\n"
         "• /history — последние задачи\n"
-        "• /addagent — добавить агента\n"
+        "• /addagent — создать агента (Managed Bot в один тап, Bot API 9.6)\n"
         "• /removeagent [slug] — удалить агента\n"
         "• /editagent [slug] — изменить промпт\n\n"
         "<b>Плагины:</b>\n"
         "• /plugins — плагины и интеграции\n"
         "• /connect [plugin] — подключить плагин\n"
         "• /disconnect [plugin] — отключить плагин\n\n"
+        "<b>Панель (Mini App):</b> кнопка меню рядом с полем ввода.\n\n"
         "<b>Прочее:</b>\n"
         "• /style [кратко|подробно|для ребёнка|для эксперта]\n"
         "• /clear — сбросить контекст"
@@ -436,7 +523,7 @@ async def _generate_and_show_spec(
                     else:
                         missing_tools.append(tool_name)
 
-        # Переходим в состояние ожидания токена
+        # Переходим в состояние ожидания токена (для fallback-пути через BotFather)
         await state.set_state(AddAgentStates.awaiting_token)
         await state.update_data(spec=spec, slug=slug, pending_id=pending_id, original_task=original_task)
 
@@ -444,21 +531,37 @@ async def _generate_and_show_spec(
         if missing_tools:
             missing_note = f"\n\n⚠️ Нет API ключей для: <code>{', '.join(missing_tools)}</code>"
 
+        # Managed Bots (Bot API 9.6): ссылка t.me/newbot/{manager}/{suggested}?name=…
+        manager_username = dynamic_loader.get_username("manager") or "teleflow_manager_bot"
+        fallback_link = managed_bots.build_fallback_link(
+            manager_username=manager_username,
+            suggested_username=username,
+            suggested_name=spec["name"],
+        )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"🚀 Создать @{username} одним тапом",
+                url=fallback_link,
+            )],
+        ])
+
         await bot.send_message(
             config.GROUP_CHAT_ID,
             f"✅ <b>Спецификация готова!</b>\n\n"
             f"<b>Имя:</b> {spec['name']}\n"
+            f"<b>Username:</b> @{username}\n"
             f"<b>Описание:</b> {spec.get('description', '')}\n\n"
-            f"<b>Создай бота в @BotFather:</b>\n"
-            f"1. Отправь /newbot\n"
-            f"2. Имя: <code>{spec['name']}</code>\n"
-            f"3. Username: <code>{username}</code>\n"
-            f"4. <a href='https://t.me/{username}?startgroup=true'>Нажми сюда</a> чтобы добавить @{username} в группу\n"
-            f"5. Дай ему права администратора\n"
-            f"6. Скопируй токен и отправь его сюда"
+            f"🆕 <b>Managed Bot (Telegram 9.6):</b>\n"
+            f"Нажми кнопку ниже — Telegram сам создаст и привяжет бота, "
+            f"токен подтянется автоматически.\n\n"
+            f"<i>Альтернатива:</i> создай через @BotFather вручную "
+            f"(/newbot → имя <code>{spec['name']}</code> → username <code>{username}</code>) "
+            f"и пришли токен сюда следующим сообщением."
             f"{missing_note}",
             parse_mode="HTML",
             disable_web_page_preview=True,
+            reply_markup=kb,
         )
     except Exception as exc:
         logger.error("Agent spec generation failed: %s", exc)

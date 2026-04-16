@@ -24,6 +24,10 @@ GROUP_CHAT_ID: int = int(_require("GROUP_CHAT_ID"))
 TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
+# Mini App
+WEBAPP_URL: str = os.getenv("WEBAPP_URL", "")  # публичный HTTPS URL панели
+WEBAPP_PORT: int = int(os.getenv("WEBAPP_PORT", "8080"))
+
 # Константы модели
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 1024

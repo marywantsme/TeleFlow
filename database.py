@@ -215,6 +215,29 @@ async def get_agent_by_slug(slug: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+async def get_agent_by_username(username: str) -> Optional[dict]:
+    """Возвращает агента по username (без @) или None."""
+    uname = username.lstrip("@").lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM agents_registry WHERE LOWER(username) = ?",
+            (uname,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def update_agent_token(slug: str, token: str) -> None:
+    """Обновляет токен агента и активирует его."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE agents_registry SET token = ?, is_active = 1 WHERE slug = ?",
+            (token, slug),
+        )
+        await db.commit()
+
+
 async def upsert_agent(
     slug: str,
     name: str,
