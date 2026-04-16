@@ -126,7 +126,10 @@ async def _handle_managed_bot_update(mb_update: dict) -> None:
         except Exception as exc:
             logger.warning("FSM clear failed for user %s: %s", creator_user_id, exc)
 
+    # Проверяем — состоит ли свежий managed-бот в рабочей группе.
+    # Если нет — Telegram вернёт "chat not found" и все задачи к нему будут падать.
     new_bot = dynamic_loader.get_bot(slug)
+    in_group = False
     if new_bot:
         try:
             await new_bot.send_message(
@@ -134,14 +137,33 @@ async def _handle_managed_bot_update(mb_update: dict) -> None:
                 f"👋 Привет! Я — <b>{bot_name or slug}</b>. Готов к работе!",
                 parse_mode="HTML",
             )
-        except Exception:
-            pass
+            in_group = True
+        except Exception as exc:
+            logger.info("New managed bot '%s' not in group yet: %s", slug, exc)
 
-    await bot.send_message(
-        config.GROUP_CHAT_ID,
-        f"✅ Managed-бот <b>{bot_name or slug}</b> (@{bot_username}) создан и подключён!",
-        parse_mode="HTML",
-    )
+    if in_group:
+        await bot.send_message(
+            config.GROUP_CHAT_ID,
+            f"✅ Managed-бот <b>{bot_name or slug}</b> (@{bot_username}) создан и подключён!",
+            parse_mode="HTML",
+        )
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"➕ Добавить @{bot_username} в группу",
+                url=f"https://t.me/{bot_username}?startgroup=true&admin=post_messages",
+            )
+        ]])
+        await bot.send_message(
+            config.GROUP_CHAT_ID,
+            (
+                f"✅ Managed-бот <b>{bot_name or slug}</b> (@{bot_username}) создан!\n\n"
+                "⚠️ Осталось добавить его в эту группу — иначе он не сможет "
+                "отвечать на задачи. Нажми кнопку ниже и выбери этот чат."
+            ),
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
 
 
 def _manager():
