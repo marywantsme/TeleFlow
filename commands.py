@@ -34,7 +34,12 @@ class AddAgentStates(StatesGroup):
     awaiting_token = State()
 
 
+_dp_ref: Dispatcher | None = None
+
+
 def setup(dp: Dispatcher) -> None:
+    global _dp_ref
+    _dp_ref = dp
     dp.include_router(router)
     dp.update.outer_middleware(_managed_bot_middleware)
 
@@ -104,6 +109,22 @@ async def _handle_managed_bot_update(mb_update: dict) -> None:
         await dynamic_loader.add_bot(slug, token, start_polling=False)
     except Exception as exc:
         logger.error("add_bot failed for %s: %s", slug, exc)
+
+    # Чистим FSM-состояние создателя — он больше не в awaiting_token/awaiting_description,
+    # иначе его следующее сообщение будет воспринято как токен.
+    creator_user_id = (mb_update.get("user") or {}).get("id", 0)
+    if creator_user_id and _dp_ref and bot:
+        try:
+            from aiogram.fsm.storage.base import StorageKey
+            key = StorageKey(
+                bot_id=bot.id,
+                chat_id=config.GROUP_CHAT_ID,
+                user_id=creator_user_id,
+            )
+            await _dp_ref.storage.set_state(key, state=None)
+            await _dp_ref.storage.set_data(key, data={})
+        except Exception as exc:
+            logger.warning("FSM clear failed for user %s: %s", creator_user_id, exc)
 
     new_bot = dynamic_loader.get_bot(slug)
     if new_bot:
